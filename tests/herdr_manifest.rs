@@ -22,7 +22,11 @@ impl Herdr for FakeHerdr {
         let success = !is_get || self.pane_exists;
         Ok(Output {
             status: ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
-            stdout: if success { b"{}".to_vec() } else { Vec::new() },
+            stdout: if success {
+                br#"{"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}}"#.to_vec()
+            } else {
+                Vec::new()
+            },
             stderr: Vec::new(),
         })
     }
@@ -130,6 +134,10 @@ fn open_uses_exact_documented_plugin_pane_arguments() {
             "--focus",
         ]
     );
+    assert_eq!(
+        herdr.calls.lock().expect("calls")[1],
+        ["pane", "zoom", "w1:p2", "--on"]
+    );
 }
 
 #[test]
@@ -222,6 +230,7 @@ fn open_focuses_live_viewer_and_replaces_stale_mapping() {
     let calls = live.calls.lock().expect("calls");
     assert_eq!(calls[0], ["pane", "get", "w1:p2"]);
     assert_eq!(calls[1], ["plugin", "pane", "focus", "w1:p2"]);
+    assert_eq!(calls[2], ["pane", "zoom", "w1:p2", "--on"]);
     drop(calls);
 
     let missing_viewer = FakeHerdr {

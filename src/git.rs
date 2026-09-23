@@ -4,15 +4,202 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use crate::diff::{DiffLine, parse_unified_diff};
-use crate::model::ChangeKind;
+use crate::model::{ChangeKind, CurrentFile, INLINE_TEXT_LIMIT, TextEligibility};
 use crate::project::ProjectScope;
 
 const MAX_GIT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitComparison {
     WorkingTree,
     Unpushed,
+    Commit { base: String, tip: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommit {
+    pub oid: String,
+    pub parent: String,
+    pub date: String,
+    pub subject: String,
+}
+
+impl GitCommit {
+    #[must_use]
+    pub fn comparison(&self) -> GitComparison {
+        GitComparison::Commit {
+            base: self.parent.clone(),
+            tip: self.oid.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommitRange {
+    pub newest: GitCommit,
+    pub oldest: GitCommit,
+    pub count: usize,
+}
+
+impl GitCommitRange {
+    /// A combined diff includes every commit along one first-parent chain.
+    pub fn from_commits(commits: &[&GitCommit]) -> Result<Self, String> {
+        let newest = commits.first().ok_or("No commits selected.")?;
+        let oldest = commits.last().ok_or("No commits selected.")?;
+        if commits.windows(2).any(|pair| pair[0].parent != pair[1].oid) {
+            return Err("Select consecutive commits on one first-parent chain; clear the filter if it hides commits.".into());
+        }
+        Ok(Self {
+            newest: (*newest).clone(),
+            oldest: (*oldest).clone(),
+            count: commits.len(),
+        })
+    }
+
+    #[must_use]
+    pub fn comparison(&self) -> GitComparison {
+        GitComparison::Commit {
+            base: self.oldest.parent.clone(),
+            tip: self.newest.oid.clone(),
+        }
+    }
+}
+
+/// Recent history reachable from HEAD, newest first. Merges use their first parent.
+pub fn commits(root: &Path) -> Result<Vec<GitCommit>, String> {
+    let output = run_git(
+        root,
+        [
+            "log",
+            "-z",
+            "--max-count=200",
+            "--date=short",
+            "--format=%H%x00%P%x00%ad%x00%s",
+            "HEAD",
+            "--",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Unable to read commit history"));
+    }
+    ensure_output_limit(&output.stdout, "Commit history")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<_> = text
+        .strip_suffix('\0')
+        .unwrap_or(&text)
+        .split('\0')
+        .collect();
+    let mut commits = Vec::new();
+    for record in fields.chunks_exact(4) {
+        // `git log` hides parents at shallow boundaries. Read the actual object
+        // before treating a commit as a root, so missing history is not shown as
+        // a commit that added the entire repository.
+        let parent = if let Some(parent) = record[1].split_whitespace().next() {
+            Some(parent.to_owned())
+        } else {
+            let object = run_git(root, ["cat-file", "-p", record[0]])?;
+            if !object.status.success() {
+                return Err(command_error(&object, "Unable to read commit parents"));
+            }
+            String::from_utf8_lossy(&object.stdout)
+                .lines()
+                .take_while(|line| !line.is_empty())
+                .find_map(|line| line.strip_prefix("parent ").map(str::to_owned))
+        };
+        let parent = if let Some(parent) = parent {
+            parent
+        } else {
+            // Git supplies the empty tree for both SHA-1 and SHA-256 repositories.
+            let empty = git_command(root)
+                .args(["hash-object", "-t", "tree", "--stdin"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !empty.status.success() {
+                return Err(command_error(&empty, "Unable to resolve empty tree"));
+            }
+            String::from_utf8_lossy(&empty.stdout).trim().to_owned()
+        };
+        commits.push(GitCommit {
+            oid: record[0].to_owned(),
+            parent,
+            date: record[2].to_owned(),
+            subject: record[3].to_owned(),
+        });
+    }
+    Ok(commits)
+}
+
+/// List committed files without checking out or walking the working directory.
+pub fn revision_files(root: &Path, revision: &str) -> Result<Vec<CurrentFile>, String> {
+    let output = run_git(root, ["ls-tree", "-r", "-l", "-z", revision, "--", "."])?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Unable to list committed files"));
+    }
+    ensure_output_limit(&output.stdout, "Committed files")?;
+    let scope = ProjectScope::discover(root);
+    let mut files = Vec::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| "Git returned an invalid tree record.".to_owned())?;
+        let header = String::from_utf8_lossy(&record[..tab]);
+        let fields: Vec<_> = header.split_whitespace().collect();
+        // Do not follow committed symlinks or submodules.
+        if fields.len() != 4 || !matches!(fields[0], "100644" | "100755") {
+            continue;
+        }
+        let relative = path_from_bytes(&record[tab + 1..])?;
+        if scope
+            .as_ref()
+            .is_some_and(|scope| !scope.contains_path(root, &relative))
+        {
+            continue;
+        }
+        let size = fields[3]
+            .parse::<u64>()
+            .map_err(|error| error.to_string())?;
+        files.push(CurrentFile {
+            absolute: root.join(&relative),
+            relative,
+            size,
+            modified_unix_ns: None,
+            text: if size > INLINE_TEXT_LIMIT {
+                TextEligibility::Oversized
+            } else {
+                TextEligibility::Text
+            },
+        });
+    }
+    Ok(files)
+}
+
+pub fn revision_source(root: &Path, revision: &str, file: &CurrentFile) -> Result<String, String> {
+    if file.size > INLINE_TEXT_LIMIT {
+        return Err("File exceeds the 2 MiB preview limit.".into());
+    }
+    let mut object = OsString::from(format!("{revision}:./"));
+    object.push(&file.relative);
+    let output = git_command(root)
+        .arg("show")
+        .arg(object)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(command_error(&output, "Unable to read committed file"));
+    }
+    if output.stdout.len() as u64 > INLINE_TEXT_LIMIT {
+        return Err("File exceeds the 2 MiB preview limit.".into());
+    }
+    if output.stdout.contains(&0) {
+        return Err("Binary file; source preview unavailable.".into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| "File is not valid UTF-8.".into())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,11 +234,11 @@ pub struct GitChange {
     pub state: GitFileState,
 }
 
-pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, String> {
+pub fn scan(root: &Path, comparison: &GitComparison) -> Result<Vec<GitChange>, String> {
     ensure_head(root)?;
     let scope = ProjectScope::discover(root);
     let reference = match comparison {
-        GitComparison::WorkingTree => "HEAD",
+        GitComparison::WorkingTree => "HEAD".to_owned(),
         GitComparison::Unpushed => {
             let upstream = run_git(
                 root,
@@ -63,8 +250,9 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
                         .into(),
                 );
             }
-            "@{upstream}..HEAD"
+            "@{upstream}..HEAD".to_owned()
         }
+        GitComparison::Commit { base, tip } => format!("{base}..{tip}"),
     };
 
     let tracked = run_git(
@@ -77,7 +265,7 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
             "--find-renames",
             "--no-ext-diff",
             "--no-textconv",
-            reference,
+            &reference,
             "--",
         ],
     )?;
@@ -87,7 +275,7 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
     ensure_output_limit(&tracked.stdout, "Git status")?;
 
     let mut changes = parse_name_status(&tracked.stdout, comparison)?;
-    if comparison == GitComparison::WorkingTree {
+    if *comparison == GitComparison::WorkingTree {
         let statuses = scan_worktree_states(root)?;
         let untracked = run_git(
             root,
@@ -125,7 +313,7 @@ pub fn scan(root: &Path, comparison: GitComparison) -> Result<Vec<GitChange>, St
                     path,
                     old_path: None,
                     untracked: true,
-                    comparison,
+                    comparison: comparison.clone(),
                     state: GitFileState::Untracked,
                 });
             }
@@ -178,9 +366,10 @@ pub fn diff(root: &Path, change: &GitChange) -> Result<Vec<DiffLine>, String> {
             .output()
             .map_err(|error| format!("Unable to run Git diff: {error}"))?
     } else {
-        let reference = match change.comparison {
-            GitComparison::WorkingTree => "HEAD",
-            GitComparison::Unpushed => "@{upstream}..HEAD",
+        let reference = match &change.comparison {
+            GitComparison::WorkingTree => "HEAD".to_owned(),
+            GitComparison::Unpushed => "@{upstream}..HEAD".to_owned(),
+            GitComparison::Commit { base, tip } => format!("{base}..{tip}"),
         };
         let mut command = git_command(root);
         command.args([
@@ -190,11 +379,14 @@ pub fn diff(root: &Path, change: &GitChange) -> Result<Vec<DiffLine>, String> {
             "--no-color",
             "--find-renames",
             "--unified=3",
-            reference,
+            &reference,
             "--",
         ]);
+        command.arg(&change.path);
+        if let Some(old_path) = &change.old_path {
+            command.arg(old_path);
+        }
         command
-            .arg(&change.path)
             .output()
             .map_err(|error| format!("Unable to run Git diff: {error}"))?
     };
@@ -218,7 +410,7 @@ fn ensure_head(root: &Path) -> Result<(), String> {
     }
 }
 
-fn parse_name_status(bytes: &[u8], comparison: GitComparison) -> Result<Vec<GitChange>, String> {
+fn parse_name_status(bytes: &[u8], comparison: &GitComparison) -> Result<Vec<GitChange>, String> {
     let mut tokens = bytes.split(|byte| *byte == 0);
     let mut changes = Vec::new();
     while let Some(status) = tokens.next().filter(|status| !status.is_empty()) {
@@ -253,10 +445,10 @@ fn parse_name_status(bytes: &[u8], comparison: GitComparison) -> Result<Vec<GitC
             path,
             old_path,
             untracked: false,
-            comparison,
+            comparison: comparison.clone(),
             state: match comparison {
                 GitComparison::WorkingTree => GitFileState::Unstaged,
-                GitComparison::Unpushed => GitFileState::Committed,
+                GitComparison::Unpushed | GitComparison::Commit { .. } => GitFileState::Committed,
             },
         });
     }
@@ -351,6 +543,7 @@ fn git_command(root: &Path) -> Command {
         .arg(safe_directory)
         .arg("-C")
         .arg(canonical_root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
     command
@@ -428,7 +621,8 @@ mod tests {
         git(directory.as_ref(), ["add", "staged.txt"]);
         fs::write(directory.path().join("untracked.txt"), "new\n").expect("write untracked");
 
-        let changes = scan(directory.path(), GitComparison::WorkingTree).expect("scan git changes");
+        let changes =
+            scan(directory.path(), &GitComparison::WorkingTree).expect("scan git changes");
         assert_eq!(changes.len(), 4);
         let tracked = changes
             .iter()
@@ -524,7 +718,7 @@ mod tests {
         fs::write(directory.path().join("java/other/Added.java"), "other\n")
             .expect("other untracked");
 
-        let changes = scan(directory.path(), GitComparison::WorkingTree).expect("scan changes");
+        let changes = scan(directory.path(), &GitComparison::WorkingTree).expect("scan changes");
         let paths: Vec<_> = changes.iter().map(|change| &change.path).collect();
         assert_eq!(
             paths,
@@ -570,7 +764,7 @@ mod tests {
             .expect("selected untracked");
         fs::write(project.join("java/other/Added.java"), "other\n").expect("other untracked");
 
-        let changes = scan(&project, GitComparison::WorkingTree).expect("scan changes");
+        let changes = scan(&project, &GitComparison::WorkingTree).expect("scan changes");
         let paths: Vec<_> = changes.iter().map(|change| &change.path).collect();
         assert_eq!(
             paths,
@@ -627,7 +821,7 @@ mod tests {
             ],
         );
 
-        let changes = scan(directory.path(), GitComparison::Unpushed).expect("scan unpushed");
+        let changes = scan(directory.path(), &GitComparison::Unpushed).expect("scan unpushed");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, std::path::Path::new("tracked.txt"));
         assert_eq!(changes[0].comparison, GitComparison::Unpushed);
@@ -662,7 +856,8 @@ mod tests {
         let invalid_name = OsString::from_vec(b"linux-\xff.txt".to_vec());
         fs::write(directory.path().join(&invalid_name), "new\n").expect("write non-UTF-8 path");
 
-        let changes = scan(directory.path(), GitComparison::WorkingTree).expect("scan git changes");
+        let changes =
+            scan(directory.path(), &GitComparison::WorkingTree).expect("scan git changes");
         let change = changes
             .iter()
             .find(|change| change.path.as_os_str() == invalid_name)

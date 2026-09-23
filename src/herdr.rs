@@ -107,9 +107,12 @@ fn open_or_focus_at(
                     "plugin".into(),
                     "pane".into(),
                     "focus".into(),
-                    mapping.viewer_pane_id,
+                    mapping.viewer_pane_id.clone(),
                 ],
             )?;
+            if placement == ViewerPlacement::Split {
+                zoom_viewer(herdr, &mapping.viewer_pane_id)?;
+            }
             return Ok(());
         }
         store.remove_viewer_mapping_for(target, placement)?;
@@ -152,7 +155,22 @@ fn open_or_focus_at(
         add_root_environment(&mut arguments, context.cwd.as_deref());
         arguments.push("--focus".into());
     }
-    checked(herdr, &arguments)?;
+    let response = checked(herdr, &arguments)?;
+    if placement == ViewerPlacement::Split {
+        let pane_id = response
+            .pointer("/result/plugin_pane/pane/pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Message("Herdr did not return the viewer pane id".into()))?;
+        zoom_viewer(herdr, pane_id)?;
+    }
+    Ok(())
+}
+
+fn zoom_viewer(herdr: &impl Herdr, pane_id: &str) -> Result<()> {
+    checked(
+        herdr,
+        &["pane".into(), "zoom".into(), pane_id.into(), "--on".into()],
+    )?;
     Ok(())
 }
 

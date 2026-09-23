@@ -138,7 +138,7 @@ The plugin manifest, [`herdr-plugin.toml`](herdr-plugin.toml), registers pane cl
 | --- | --- |
 | `pane.closed` | Remove stale viewer mappings for a closed pane. |
 | `pane.exited` | Remove stale viewer mappings for an exited pane. |
-| `herdr-agent-diff.open` | Open the viewer in a split beside the agent pane. |
+| `herdr-agent-diff.open` | Open or focus the viewer and zoom it to fill the tab. |
 | `herdr-agent-diff.open-tab` | Open the viewer in a separate Herdr tab. |
 
 Example Herdr key bindings:
@@ -159,9 +159,11 @@ description = "Git changes in tab"
 
 ## 🎛️ Using the viewer
 
+`Ctrl+A`, then `d` opens the viewer full-screen within the tab. `Ctrl+A`, then `z` toggles between the viewer and the split layout. Press `q` to return to the commit picker, then `q` again to close the viewer and return to the terminal. These bindings assume the prefix is set to `ctrl+a`.
+
 ### 🔄 Changes tab
 
-The sidebar is organized by folders. Click a folder row, or place the cursor on it and press Enter, to expand or collapse that folder. Select a file to inspect its diff. Press `b` to hide or show the sidebar.
+The sidebar is organized by folders. Press Tab to focus it, then use Up/Down or `j`/`k` to select folders or files. Press Enter on a folder to expand or collapse it, or click it with the mouse. Collapsed files are skipped by keyboard navigation. Select a file to inspect its diff. Press `b` to hide or show the sidebar.
 
 The Changes tab opens in Git diff mode. Press `g` to switch to Unpushed commits mode:
 
@@ -170,6 +172,35 @@ Git diff  ⇄  Unpushed commits
 ```
 
 Git diff answers: “What local edits are not in `HEAD`?” Unpushed commits answers: “What committed edits are ahead of the tracked remote branch?”
+
+### Commit picker
+
+Press `c` to browse the latest 200 commits reachable from the current checkout's
+`HEAD`, including pushed commits. Use Up/Down or `j`/`k`, then Enter to review a
+commit. Press Space (or `x`) to toggle a commit's checkbox, then move with the
+ordinary arrows and mark more commits. Checked commits stay selected as you move.
+Enter reviews the checked commits together; with no boxes checked it reviews the
+highlighted commit. Choose consecutive commits on one first-parent chain.
+
+Alternatively, hold Shift and press Up/Down to extend or shrink a contiguous
+selection. This replaces any checkbox selection. Unmodified arrows clear a Shift
+range but preserve individually checked commits.
+Press `/` to filter by message or hash, Enter to finish filtering, and
+Enter again to select. Escape cancels the picker; while typing a filter it first
+leaves filter input.
+
+Changes compares the chosen commit against its first parent. Root commits compare
+against an empty tree. Files browses the complete source tree at the chosen commit,
+including files that have since been changed or deleted. Binary and oversized
+files keep the existing preview limits. Nothing is checked out, staged, or reset.
+
+Press `q` to return to the commit picker with your previous position and selection,
+or `c` to refresh the commit list. Press `g` in Changes to return to local
+Git changes and working files. A range compares the oldest selected commit's
+parent with the newest selected commit. Files shows the newest selected commit.
+Selected commits must be consecutive on one first-parent chain; a selection
+that skips commits (for example because a filter hides them) is rejected rather
+than including hidden changes. Starting a filter clears the selection.
 
 ### 📄 Files tab
 
@@ -182,7 +213,8 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `1` | Select the Changes tab. |
 | `2` | Select the Files tab. |
 | `b` | Hide or show the sidebar. |
-| `g` | Toggle Git diff and Unpushed commits modes. |
+| `g` | Toggle Git diff and Unpushed commits modes; leave commit review. |
+| `c` | Pick a commit from the history of HEAD. |
 | `Tab` | Move focus between the sidebar and diff/content pane. |
 | Arrow keys, `h`/`j`/`k`/`l` | Navigate the focused area. |
 | `Enter` | Open a selected file or toggle a selected folder. |
@@ -190,7 +222,8 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `r` | Refresh the current comparison or file view. |
 | `Ctrl+C` on Linux (`⌘C` on macOS) | Copy selected text from the read-only Files pane. |
 | `?` | Show the help overlay. |
-| `q` or `Esc` | Close the viewer or dismiss an overlay. |
+| `q` | Return to the commit picker; from the picker, close the viewer. While filtering, type `q`. |
+| `Esc` | Leave filter input or cancel the commit picker. |
 
 Mouse clicks select tabs, folders, and files. Drag the sidebar or diff scrollbar to move quickly through long content. Scrolling over a pane keeps the pointer's pane active.
 

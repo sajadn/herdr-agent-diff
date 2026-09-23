@@ -35,7 +35,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::diff::{DiffLine, DiffLineKind};
 use crate::git::{
-    GitChange, GitComparison, GitFileState, diff as render_git_diff, scan as scan_git,
+    GitChange, GitCommit, GitCommitRange, GitComparison, GitFileState, commits,
+    diff as render_git_diff, revision_files, revision_source, scan as scan_git,
     unpushed_commit_count,
 };
 use crate::herdr::{Herdr, pane_exists};
@@ -75,24 +76,35 @@ enum Tab {
     Files,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ChangesMode {
     Git,
     Unpushed,
+    Commit(GitCommit),
+    CommitRange(GitCommitRange),
 }
 
 impl ChangesMode {
-    fn label(self) -> &'static str {
+    fn label(&self) -> String {
         match self {
-            Self::Git => "Git diff",
-            Self::Unpushed => "Unpushed commits",
+            Self::Git => "Git diff".into(),
+            Self::Unpushed => "Unpushed commits".into(),
+            Self::Commit(commit) => format!("Commit {}", &commit.oid[..8]),
+            Self::CommitRange(range) => format!(
+                "{} commits {} → {}",
+                range.count,
+                &range.oldest.oid[..8],
+                &range.newest.oid[..8]
+            ),
         }
     }
 
-    fn comparison(self) -> GitComparison {
+    fn comparison(&self) -> GitComparison {
         match self {
             Self::Git => GitComparison::WorkingTree,
             Self::Unpushed => GitComparison::Unpushed,
+            Self::Commit(commit) => commit.comparison(),
+            Self::CommitRange(range) => range.comparison(),
         }
     }
 }
@@ -143,6 +155,7 @@ enum Mode {
     Normal,
     Help,
     Filter,
+    Commits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,6 +182,7 @@ enum NavigationRow {
 #[derive(Clone, Debug, Default)]
 struct TabState {
     selected: usize,
+    navigation_group: Option<(PathBuf, usize)>,
     list_scroll_y: usize,
     scroll_y: usize,
     scroll_x: usize,
@@ -252,10 +266,18 @@ type DiffView<'a> = (
 
 enum Task {
     Scan(u64),
+    RevisionScan {
+        generation: u64,
+        revision: String,
+    },
+    Commits {
+        request: u64,
+    },
     Highlight {
         generation: u64,
         index: usize,
         file: CurrentFile,
+        revision: Option<String>,
     },
     GitScan {
         generation: u64,
@@ -276,6 +298,10 @@ struct ScanResult {
 }
 
 enum WorkResult {
+    Commits {
+        request: u64,
+        result: std::result::Result<Vec<GitCommit>, String>,
+    },
     Scan(Box<ScanResult>),
     SourcePreview {
         generation: u64,
@@ -665,9 +691,24 @@ impl Drop for TerminalSession {
     }
 }
 
+#[derive(Default)]
+struct CommitPicker {
+    commits: Vec<GitCommit>,
+    commit_selection: usize,
+    selection_anchor: Option<usize>,
+    marked_commits: BTreeSet<usize>,
+    selection_error: Option<String>,
+    commit_filter: String,
+    commit_filtering: bool,
+    commit_request: u64,
+    commits_loading: bool,
+    commits_error: Option<String>,
+}
+
 struct App {
     tab: Tab,
     changes_mode: ChangesMode,
+    picker: CommitPicker,
     sidebar_visible: bool,
     focus: Focus,
     changes_state: TabState,
@@ -685,7 +726,7 @@ struct App {
     requested: BTreeSet<(Tab, usize, u64)>,
     git_diff_cache: Cache<usize, Vec<DiffLine>>,
     diff_metrics_cache: Cache<usize, DiffRenderMetrics>,
-    git_scan_cache: [Option<GitScanCache>; 2],
+    git_scan_cache: [Option<GitScanCache>; 3],
     unpushed_commits: Option<usize>,
     source_cache: Cache<usize, Vec<Vec<ColoredSpan>>>,
     source_width_cache: Cache<usize, usize>,
@@ -706,6 +747,7 @@ impl App {
         Self {
             tab: Tab::Changes,
             changes_mode: ChangesMode::Git,
+            picker: CommitPicker::default(),
             sidebar_visible: true,
             focus: Focus::Navigation,
             changes_state: TabState::default(),
@@ -723,7 +765,7 @@ impl App {
             requested: BTreeSet::new(),
             git_diff_cache: Cache::new(),
             diff_metrics_cache: Cache::new(),
-            git_scan_cache: [None, None],
+            git_scan_cache: [None, None, None],
             unpushed_commits: None,
             source_cache: Cache::new(),
             source_width_cache: Cache::new(),
@@ -743,6 +785,26 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn apply_result(&mut self, result: WorkResult) {
         match result {
+            WorkResult::Commits { request, result } if request == self.picker.commit_request => {
+                self.picker.commits_loading = false;
+                self.picker.selection_anchor = None;
+                self.picker.marked_commits.clear();
+                self.picker.selection_error = None;
+                match result {
+                    Ok(commits) => {
+                        self.picker.commits = commits;
+                        self.picker.commits_error = None;
+                    }
+                    Err(error) => {
+                        self.picker.commits.clear();
+                        self.picker.commits_error = Some(error);
+                    }
+                }
+                self.picker.commit_selection = self
+                    .picker
+                    .commit_selection
+                    .min(self.filtered_commits().len().saturating_sub(1));
+            }
             WorkResult::Scan(result) if result.generation == self.generation => {
                 self.apply_scan_result(*result);
             }
@@ -770,7 +832,7 @@ impl App {
                 unpushed_commits,
                 error,
             } if generation == self.render_generation => {
-                self.apply_git_scan(comparison, changes, unpushed_commits, error);
+                self.apply_git_scan(&comparison, changes, unpushed_commits, error);
             }
             WorkResult::GitDiff {
                 generation,
@@ -806,7 +868,7 @@ impl App {
                 self.git_changes.clear();
                 self.git_diff_cache.clear();
                 self.diff_metrics_cache.clear();
-                self.git_scan_cache = [None, None];
+                self.git_scan_cache = [None, None, None];
                 self.unpushed_commits = None;
                 self.git_error = None;
                 self.git_state = GitState::Unloaded;
@@ -857,7 +919,7 @@ impl App {
 
     fn apply_git_scan(
         &mut self,
-        comparison: GitComparison,
+        comparison: &GitComparison,
         changes: Vec<GitChange>,
         unpushed_commits: Option<usize>,
         error: Option<String>,
@@ -903,7 +965,13 @@ impl App {
             return false;
         }
         let generation = self.generation.saturating_add(1);
-        if tasks.try_send(Task::Scan(generation)).is_ok() {
+        let task = self
+            .revision()
+            .map_or(Task::Scan(generation), |revision| Task::RevisionScan {
+                generation,
+                revision: revision.to_owned(),
+            });
+        if tasks.try_send(task).is_ok() {
             self.generation = generation;
             newest.store(generation, Ordering::Release);
             self.loading = true;
@@ -912,7 +980,7 @@ impl App {
             self.git_changes.clear();
             self.git_diff_cache.clear();
             self.diff_metrics_cache.clear();
-            self.git_scan_cache = [None, None];
+            self.git_scan_cache = [None, None, None];
             self.unpushed_commits = None;
             self.git_error = None;
             self.git_state = GitState::Unloaded;
@@ -923,6 +991,9 @@ impl App {
     }
 
     fn request_selected(&mut self, tasks: &mpsc::SyncSender<Task>) {
+        if self.mode == Mode::Commits {
+            return;
+        }
         if self.tab == Tab::Changes && self.git_state != GitState::Loaded {
             if self.git_state == GitState::Loading {
                 return;
@@ -985,6 +1056,7 @@ impl App {
                             generation,
                             index: selected,
                             file,
+                            revision: self.revision().map(str::to_owned),
                         })
                         .is_ok()
                 {
@@ -1000,9 +1072,13 @@ impl App {
         }
         self.changes_mode = match self.changes_mode {
             ChangesMode::Git => ChangesMode::Unpushed,
-            ChangesMode::Unpushed => ChangesMode::Git,
+            ChangesMode::Unpushed | ChangesMode::Commit(_) | ChangesMode::CommitRange(_) => {
+                ChangesMode::Git
+            }
         };
         self.changes_state.selected = 0;
+        self.changes_state.navigation_group = None;
+        self.changes_state.list_scroll_y = 0;
         self.changes_state.scroll_y = 0;
         self.changes_state.scroll_x = 0;
         self.render_generation = self.render_generation.saturating_add(1);
@@ -1013,7 +1089,7 @@ impl App {
         self.unpushed_commits = None;
         self.git_error = None;
         if let Some(cache) =
-            self.git_scan_cache[git_comparison_index(self.changes_mode.comparison())].as_ref()
+            self.git_scan_cache[git_comparison_index(&self.changes_mode.comparison())].as_ref()
         {
             self.git_changes = cache.changes.clone();
             self.unpushed_commits = cache.unpushed_commits;
@@ -1024,6 +1100,255 @@ impl App {
         }
     }
 
+    fn revision(&self) -> Option<&str> {
+        match &self.changes_mode {
+            ChangesMode::Commit(commit) => Some(&commit.oid),
+            ChangesMode::CommitRange(range) => Some(&range.newest.oid),
+            _ => None,
+        }
+    }
+
+    fn filtered_commits(&self) -> Vec<usize> {
+        let needle = self.picker.commit_filter.to_lowercase();
+        self.picker
+            .commits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, commit)| {
+                (commit.subject.to_lowercase().contains(&needle) || commit.oid.contains(&needle))
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn open_commits(&mut self, tasks: &mpsc::SyncSender<Task>) {
+        self.mode = Mode::Commits;
+        self.picker.selection_anchor = None;
+        self.picker.marked_commits.clear();
+        self.picker.selection_error = None;
+        self.picker.commit_filter.clear();
+        self.picker.commit_filtering = false;
+        self.picker.commit_selection = 0;
+        self.picker.commit_request = self.picker.commit_request.saturating_add(1);
+        self.picker.commits_loading = false;
+        self.picker.commits_error = None;
+        if tasks
+            .try_send(Task::Commits {
+                request: self.picker.commit_request,
+            })
+            .is_ok()
+        {
+            self.picker.commits_loading = true;
+        } else {
+            self.picker.commits_error = Some("Worker busy; press Esc and c to retry.".into());
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_commit_key(
+        &mut self,
+        key: KeyEvent,
+        newest: &AtomicU64,
+        tasks: &mpsc::SyncSender<Task>,
+    ) {
+        if self.picker.commit_filtering {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => self.picker.commit_filtering = false,
+                KeyCode::Backspace => {
+                    self.picker.commit_filter.pop();
+                    self.picker.commit_selection = 0;
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.picker.commit_filter.push(character);
+                    self.picker.commit_selection = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+        let filtered = self.filtered_commits();
+        let destination = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                Some(self.picker.commit_selection.saturating_sub(1))
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                Some(self.picker.commit_selection.saturating_add(1))
+            }
+            KeyCode::PageUp => Some(self.picker.commit_selection.saturating_sub(10)),
+            KeyCode::PageDown => Some(self.picker.commit_selection.saturating_add(10)),
+            KeyCode::Home => Some(0),
+            KeyCode::End => Some(filtered.len().saturating_sub(1)),
+            _ => None,
+        };
+        if let Some(destination) = destination {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.picker.marked_commits.clear();
+                self.picker
+                    .selection_anchor
+                    .get_or_insert(self.picker.commit_selection);
+            } else {
+                self.picker.selection_anchor = None;
+            }
+            self.picker.commit_selection = destination.min(filtered.len().saturating_sub(1));
+            self.picker.selection_error = None;
+            return;
+        }
+        match key.code {
+            KeyCode::Char(' ' | 'x') if !self.picker.commits_loading && !filtered.is_empty() => {
+                if self.picker.selection_anchor.is_some() {
+                    self.picker.marked_commits = self.commit_selection_range().collect();
+                    self.picker.selection_anchor = None;
+                }
+                let cursor = self.picker.commit_selection;
+                if !self.picker.marked_commits.remove(&cursor) {
+                    self.picker.marked_commits.insert(cursor);
+                }
+                self.picker.selection_error = None;
+            }
+            KeyCode::Esc | KeyCode::Char('c') => self.mode = Mode::Normal,
+            KeyCode::Char('/') => {
+                self.picker.commit_filtering = true;
+                self.picker.selection_anchor = None;
+                self.picker.marked_commits.clear();
+                self.picker.selection_error = None;
+            }
+            KeyCode::Enter
+                if !self.picker.commits_loading
+                    && self.picker.commits_error.is_none()
+                    && !filtered.is_empty() =>
+            {
+                let mut selected = self.selected_commit_rows();
+                if selected.is_empty() {
+                    selected.insert(self.picker.commit_selection);
+                }
+                let commits: Vec<_> = selected
+                    .iter()
+                    .map(|row| &self.picker.commits[filtered[*row]])
+                    .collect();
+                let mode = if commits.len() == 1 {
+                    ChangesMode::Commit(commits[0].clone())
+                } else {
+                    match GitCommitRange::from_commits(&commits) {
+                        Ok(range) => ChangesMode::CommitRange(range),
+                        Err(error) => {
+                            self.picker.selection_error = Some(error);
+                            return;
+                        }
+                    }
+                };
+                let previous = self.changes_mode.clone();
+                self.changes_mode = mode;
+                if self.reset_source(newest, tasks) {
+                    self.tab = Tab::Changes;
+                    self.focus = Focus::Navigation;
+                    self.mode = Mode::Normal;
+                } else {
+                    self.changes_mode = previous;
+                    self.picker.commits_error =
+                        Some("Worker busy; press Esc and c to retry.".into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Invalidate pending work and source caches when changing the displayed tree.
+    fn reset_source(&mut self, newest: &AtomicU64, tasks: &mpsc::SyncSender<Task>) -> bool {
+        let loading = self.loading;
+        self.loading = false;
+        if !self.refresh(newest, tasks) {
+            self.loading = loading;
+            return false;
+        }
+        self.initial_scan_pending = false;
+        self.files.clear();
+        self.file_search_index = FileSearchIndex::default();
+        self.source_cache.clear();
+        self.source_width_cache.clear();
+        self.source_notices.clear();
+        self.scan_error = None;
+        self.changes_state = TabState::default();
+        self.files_state = TabState::default();
+        self.collapsed_groups.clear();
+        self.selection = None;
+        self.cursor = None;
+        self.scrollbar_drag = None;
+        true
+    }
+
+    fn commit_selection_range(&self) -> std::ops::RangeInclusive<usize> {
+        let cursor = self.picker.commit_selection;
+        let anchor = self.picker.selection_anchor.unwrap_or(cursor);
+        cursor.min(anchor)..=cursor.max(anchor)
+    }
+
+    fn selected_commit_rows(&self) -> BTreeSet<usize> {
+        if self.picker.selection_anchor.is_some() {
+            self.commit_selection_range().collect()
+        } else {
+            self.picker.marked_commits.clone()
+        }
+    }
+
+    fn draw_commits(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let selection = self.selected_commit_rows();
+        let count = selection.len();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Pick commits — {count} selected "));
+        if self.picker.commits_loading || self.picker.commits_error.is_some() {
+            let message = self
+                .picker
+                .commits_error
+                .as_deref()
+                .unwrap_or("Loading commits…");
+            frame.render_widget(Paragraph::new(message).block(block), area);
+            return;
+        }
+        let filtered = self.filtered_commits();
+        if filtered.is_empty() {
+            frame.render_widget(Paragraph::new("No matching commits.").block(block), area);
+            return;
+        }
+        let items: Vec<_> = filtered
+            .iter()
+            .enumerate()
+            .map(|(row, index)| {
+                let commit = &self.picker.commits[*index];
+                let selected = selection.contains(&row);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if selected { "[x] " } else { "[ ] " },
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("{}  ", &commit.oid[..8]),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{}  ", commit.date),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(&commit.subject),
+                ]))
+                .style(if selected {
+                    Style::default().bg(PANEL_SELECTION)
+                } else {
+                    Style::default()
+                })
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.picker.commit_selection));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block)
+                .highlight_style(Style::default().bg(PANEL_SELECTION).bold())
+                .highlight_symbol("› "),
+            area,
+            &mut state,
+        );
+    }
+
     fn toggle_sidebar(&mut self) {
         self.sidebar_visible = !self.sidebar_visible;
         self.scrollbar_drag = None;
@@ -1032,6 +1357,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -1044,16 +1370,27 @@ impl App {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return false;
         }
+        if self.mode == Mode::Commits {
+            if key.code == KeyCode::Char('q') && !self.picker.commit_filtering {
+                return true;
+            }
+            self.handle_commit_key(key, newest, tasks);
+            return false;
+        }
         if self.mode == Mode::Filter {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
                 KeyCode::Backspace => {
                     self.active_state_mut().filter.pop();
                     self.active_state_mut().selected = 0;
+                    self.active_state_mut().navigation_group = None;
+                    self.active_state_mut().list_scroll_y = 0;
                 }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.active_state_mut().filter.push(character);
                     self.active_state_mut().selected = 0;
+                    self.active_state_mut().navigation_group = None;
+                    self.active_state_mut().list_scroll_y = 0;
                 }
                 _ => {}
             }
@@ -1071,7 +1408,14 @@ impl App {
                     self.copy_selection();
                 }
             }
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') => self.open_commits(tasks),
+            KeyCode::Char('q') => {
+                if self.picker.commits.is_empty() {
+                    self.open_commits(tasks);
+                } else {
+                    self.mode = Mode::Commits;
+                }
+            }
             KeyCode::Char('?') => {
                 self.mode = if self.mode == Mode::Help {
                     Mode::Normal
@@ -1089,7 +1433,13 @@ impl App {
             }
             KeyCode::Char('g') => {
                 if self.tab == Tab::Changes {
+                    let previous = self.changes_mode.clone();
+                    let historical = self.revision().is_some();
                     self.toggle_changes_mode();
+                    if historical && !self.reset_source(newest, tasks) {
+                        self.changes_mode = previous;
+                        self.git_state = GitState::Unloaded;
+                    }
                     self.selection = None;
                 }
             }
@@ -1107,6 +1457,15 @@ impl App {
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('r') => {
                 self.refresh(newest, tasks);
+            }
+            KeyCode::Enter if self.focus == Focus::Navigation => {
+                let rows = self.navigation_rows();
+                if let Some(row) = self.selected_navigation_row(&rows)
+                    && let NavigationRow::Group { path, .. } = &rows[row]
+                {
+                    self.toggle_group(path.clone());
+                    self.keep_navigation_selection_visible();
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_vertical(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_vertical(1),
@@ -1142,14 +1501,76 @@ impl App {
             state.scroll_y = state.scroll_y.saturating_add_signed(delta);
             return;
         }
-        let length = self.filtered_indices().len();
-        if length == 0 {
-            self.active_state_mut().selected = 0;
-        } else {
-            let current = self.active_state().selected.min(length - 1);
-            self.active_state_mut().selected = current.saturating_add_signed(delta).min(length - 1);
-            self.active_state_mut().scroll_y = 0;
+        let rows = self.navigation_rows();
+        if rows.is_empty() {
+            return;
         }
+        let current = self.selected_navigation_row(&rows).unwrap_or(0);
+        let next = current.saturating_add_signed(delta).min(rows.len() - 1);
+        self.select_navigation_row(&rows[next], next);
+        self.keep_navigation_selection_visible();
+    }
+
+    fn selected_navigation_row(&self, rows: &[NavigationRow]) -> Option<usize> {
+        if let Some((group, occurrence)) = &self.active_state().navigation_group
+            && let Some((index, _)) = rows
+                .iter()
+                .enumerate()
+                .filter(
+                    |(_, row)| matches!(row, NavigationRow::Group { path, .. } if path == group),
+                )
+                .nth(*occurrence)
+        {
+            return Some(index);
+        }
+        let selected = self.actual_selected()?;
+        rows.iter()
+            .position(|row| matches!(row, NavigationRow::File { index, .. } if *index == selected))
+    }
+
+    fn select_navigation_row(&mut self, row: &NavigationRow, position: usize) {
+        self.cursor = None;
+        self.selection = None;
+        match row {
+            NavigationRow::Group { path, .. } => {
+                // A full-path folder header may appear again after nested folders.
+                let occurrence = self.navigation_rows().iter().take(position).filter(|row| {
+                    matches!(row, NavigationRow::Group { path: candidate, .. } if candidate == path)
+                }).count();
+                self.active_state_mut().navigation_group = Some((path.clone(), occurrence));
+            }
+            NavigationRow::File { index, .. } => {
+                if let Some(selected) = self
+                    .filtered_indices()
+                    .iter()
+                    .position(|candidate| candidate == index)
+                {
+                    let state = self.active_state_mut();
+                    state.navigation_group = None;
+                    state.selected = selected;
+                    state.scroll_y = 0;
+                }
+            }
+        }
+    }
+
+    fn keep_navigation_selection_visible(&mut self) {
+        let Some(area) = self.ui_layout(self.viewport).navigation else {
+            return;
+        };
+        let rows = self.navigation_rows();
+        let Some(selected) = self.selected_navigation_row(&rows) else {
+            return;
+        };
+        let height = usize::from(bordered_inner(area).height).max(1);
+        let offset = self.navigation_scroll_offset(area);
+        self.active_state_mut().list_scroll_y = if selected < offset {
+            selected
+        } else if selected >= offset.saturating_add(height) {
+            selected.saturating_add(1).saturating_sub(height)
+        } else {
+            offset
+        };
     }
 
     fn clamp_selections(&mut self) {
@@ -1555,6 +1976,9 @@ impl App {
         _newest: &AtomicU64,
         tasks: &mpsc::SyncSender<Task>,
     ) {
+        if self.mode == Mode::Commits {
+            return;
+        }
         let layout = self.ui_layout(self.viewport);
         let left_click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
         let left_drag = matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left));
@@ -1592,17 +2016,14 @@ impl App {
                 && let Some(row) = self.navigation_row_at(area, mouse.column, mouse.row)
             {
                 self.focus = Focus::Navigation;
-                self.cursor = None;
-                self.selection = None;
+                let position = self
+                    .navigation_scroll_offset(area)
+                    .saturating_add(usize::from(
+                        mouse.row.saturating_sub(bordered_inner(area).y),
+                    ));
+                self.select_navigation_row(&row, position);
                 match row {
-                    NavigationRow::File { index, .. } => {
-                        let selected = self
-                            .filtered_indices()
-                            .iter()
-                            .position(|candidate| *candidate == index)
-                            .unwrap_or(index);
-                        self.active_state_mut().selected = selected;
-                        self.active_state_mut().scroll_y = 0;
+                    NavigationRow::File { .. } => {
                         self.request_selected(tasks);
                     }
                     NavigationRow::Group { path, .. } if left_click => {
@@ -1818,18 +2239,8 @@ impl App {
         }
     }
 
-    fn content_scrollbar_metrics(
-        &self,
-        panel_area: Rect,
-        selected: usize,
-    ) -> Option<ContentScrollbarMetrics> {
-        let area = bordered_inner(panel_area);
-        if area.is_empty() {
-            return None;
-        }
-        let [content_area, horizontal_scrollbar_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-        let (content_length_y, content_length_x) = match self.tab {
+    fn content_dimensions(&self, selected: usize) -> Option<(usize, usize)> {
+        let dimensions = match self.tab {
             Tab::Changes => {
                 let (kind, path, old_path, lines) = self.selected_diff(selected)?;
                 self.diff_metrics_cache.get(&selected).map_or_else(
@@ -1851,6 +2262,21 @@ impl App {
                 )
             }
         };
+        Some(dimensions)
+    }
+
+    fn content_scrollbar_metrics(
+        &self,
+        panel_area: Rect,
+        selected: usize,
+    ) -> Option<ContentScrollbarMetrics> {
+        let area = bordered_inner(panel_area);
+        if area.is_empty() {
+            return None;
+        }
+        let [content_area, horizontal_scrollbar_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let (content_length_y, content_length_x) = self.content_dimensions(selected)?;
         Some(ContentScrollbarMetrics {
             vertical: scrollbar_geometry(
                 ScrollbarAxis::Vertical,
@@ -1875,7 +2301,7 @@ impl App {
         let area = frame.area();
         self.viewport = area;
         let layout = self.ui_layout(area);
-        self.clamp_source_scroll(layout.content);
+        self.clamp_content_scroll(layout.content);
         let tab_index = usize::from(self.tab == Tab::Files);
         frame.render_widget(
             Tabs::new(["Changes", "Files"])
@@ -1883,7 +2309,9 @@ impl App {
                 .highlight_style(Style::default().fg(Color::Cyan).bold()),
             layout.tabs,
         );
-        if self.mode == Mode::Help {
+        if self.mode == Mode::Commits {
+            self.draw_commits(frame, layout.body);
+        } else if self.mode == Mode::Help {
             Self::draw_help(frame, layout.body);
         } else if let Some(navigation) = layout.navigation {
             self.draw_navigation(frame, navigation);
@@ -1893,56 +2321,59 @@ impl App {
         } else if let Some(content) = layout.content {
             self.draw_content(frame, content);
         }
-        let status = if self.mode == Mode::Filter {
+        let status = if self.mode == Mode::Commits {
+            if self.picker.commit_filtering {
+                format!("Filter commits: {}_", self.picker.commit_filter)
+            } else if let Some(error) = &self.picker.selection_error {
+                error.clone()
+            } else {
+                "↑↓ move   Space/x mark   Enter review   Shift+↑↓ range   / filter   Esc cancel   q close"
+                    .into()
+            }
+        } else if self.mode == Mode::Filter {
             format!("filter: {}_", self.active_state().filter)
         } else if self.loading {
             "Refreshing…".into()
         } else if let Some(error) = &self.scan_error {
-            format!("Refresh failed: {error}  r retry  ? help  q close")
+            format!("Refresh failed: {error}  r retry  ? help  q commits")
         } else if let Some(notice) = self.notices.first() {
             format!(
-                "{} notice(s): {notice}  click/wheel/drag scrollbar  Tab focus  r refresh  ? help  q close",
+                "{} notice(s): {notice}  click/wheel/drag scrollbar  Tab focus  r refresh  ? help  q commits",
                 self.notices.len()
             )
         } else {
-            "b: sidebar  g: Git diff / Unpushed  click folders  drag scrollbars  Tab focus  / filter  ? help  q close".into()
+            "c: commits  b: sidebar  g: Git diff / Unpushed  Enter: toggle folder  drag scrollbars  Tab focus  / filter  ? help  q commits".into()
         };
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
             layout.status,
         );
-        self.draw_cursor(frame, layout.content);
+        if self.mode != Mode::Commits {
+            self.draw_cursor(frame, layout.content);
+        }
     }
 
-    fn clamp_source_scroll(&mut self, content: Option<Rect>) {
-        if self.tab != Tab::Files {
-            return;
-        }
+    fn clamp_content_scroll(&mut self, content: Option<Rect>) {
         let Some(area) = content else {
             return;
         };
-        let inner = bordered_inner(area);
         let Some(selected) = self.actual_selected() else {
-            self.files_state.scroll_y = 0;
-            self.files_state.scroll_x = 0;
+            self.active_state_mut().scroll_y = 0;
+            self.active_state_mut().scroll_x = 0;
             return;
         };
-        let Some(lines) = self.source_cache.get(&selected) else {
+        let Some((content_height, content_width)) = self.content_dimensions(selected) else {
             return;
         };
-        let [content_area, _] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-        let content_width = self
-            .source_width_cache
-            .get(&selected)
-            .copied()
-            .unwrap_or_else(|| source_content_dimensions(lines).1);
-        self.files_state.scroll_y = self
-            .files_state
+        let [content_area, _] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+            .areas(bordered_inner(area));
+        // Clamp the stored offset, not just the rendered viewport. Otherwise
+        // scrolling past EOF accumulates steps that must be undone to move back.
+        let state = self.active_state_mut();
+        state.scroll_y = state
             .scroll_y
-            .min(lines.len().saturating_sub(usize::from(content_area.height)));
-        self.files_state.scroll_x = self
-            .files_state
+            .min(content_height.saturating_sub(usize::from(content_area.height)));
+        state.scroll_x = state
             .scroll_x
             .min(content_width.saturating_sub(usize::from(content_area.width)));
     }
@@ -2087,11 +2518,7 @@ impl App {
         let inner = bordered_inner(area);
         let row_width = usize::from(inner.width);
         let offset = self.navigation_scroll_offset(area);
-        let selected_row = self.actual_selected().and_then(|selected| {
-            rows.iter().position(
-                |row| matches!(row, NavigationRow::File { index, .. } if *index == selected),
-            )
-        });
+        let selected_row = self.selected_navigation_row(&rows);
         let items: Vec<ListItem<'_>> = rows
             .iter()
             .enumerate()
@@ -2151,7 +2578,10 @@ impl App {
                     format!(" {} — {} ", self.changes_mode.label(), path.display())
                 },
             ),
-            Tab::Files => " Read only ".to_owned(),
+            Tab::Files => self.revision().map_or_else(
+                || " Read only — working files ".to_owned(),
+                |revision| format!(" Read only — commit {} ", &revision[..8]),
+            ),
         };
         let block = Block::default()
             .title(title)
@@ -2174,6 +2604,9 @@ impl App {
                     match self.changes_mode {
                         ChangesMode::Git => self.empty_git_message(),
                         ChangesMode::Unpushed => "No unpushed commits.".into(),
+                        ChangesMode::Commit(_) | ChangesMode::CommitRange(_) => {
+                            "Selected commits have no net file changes.".into()
+                        }
                     }
                 }
             } else {
@@ -2432,19 +2865,22 @@ impl App {
                 "Git Changes\n\n\
                  1 / 2       Changes review / Files browser\n\
                  b           Show / hide the sidebar\n\
-                 g           Switch to Git diff / Unpushed commits in Changes\n\
+                 c           Pick commits (Space/x marks; Shift+Up/Down range; Enter review)\n\
+                 g           Return to Git diff / switch to Unpushed commits in Changes\n\
                  Tab         navigation / diff or source focus\n\
                  Mouse       click folders to expand/collapse, tabs/items/content, drag scrollbars, wheel scroll, drag select\n\
-                 ↑↓ or jk    select files / scroll content\n\
+                 ↑↓ or jk    select folders/files / scroll content\n\
+                 Enter       expand / collapse the selected folder\n\
                  ←→ or hl    horizontal scroll\n\
                  /           filter active list\n\
                  r           full refresh\n\
                  Ctrl+C / ⌘C copy selected text; mouse selections copy on release\n\
                  ?           close help\n\
-                 q           close viewer\n\n\
+                 q           return to commit picker; q there closes viewer\n\n\
                  Read only. Git diff shows local changes; Unpushed shows commits ahead of @{upstream}.\n\
                  Git diff groups files by staged, unstaged, mixed, or untracked status; empty groups are hidden.\n\
-                 Results show changes that are not yet part of the pushed branch.",
+                 Commit review compares with the first parent (empty tree for root commits).\n\
+                 Files shows the selected commit; g returns to working files.",
             )
             .block(Block::default().borders(Borders::ALL).title(" Help "))
             .wrap(Wrap { trim: false }),
@@ -2453,6 +2889,7 @@ impl App {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_worker(
     root: PathBuf,
     newest_generation: Arc<AtomicU64>,
@@ -2464,6 +2901,35 @@ fn spawn_worker(
         let theme = Arc::new(OnceLock::<Theme>::new());
         while let Ok(task) = tasks.recv() {
             match task {
+                Task::Commits { request } => {
+                    let root = root.clone();
+                    let results = results.clone();
+                    thread::spawn(move || {
+                        let _ = results.send(WorkResult::Commits {
+                            request,
+                            result: commits(&root),
+                        });
+                    });
+                }
+                Task::RevisionScan {
+                    generation,
+                    revision,
+                } => {
+                    let root = root.clone();
+                    let results = results.clone();
+                    thread::spawn(move || {
+                        let (files, error) = match revision_files(&root, &revision) {
+                            Ok(files) => (files, None),
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
+                        let _ = results.send(WorkResult::Scan(Box::new(ScanResult {
+                            generation,
+                            files,
+                            notices: Vec::new(),
+                            error,
+                        })));
+                    });
+                }
                 Task::Scan(generation) => {
                     let root = root.clone();
                     let newest_generation = Arc::clone(&newest_generation);
@@ -2496,6 +2962,7 @@ fn spawn_worker(
                     generation,
                     index,
                     file,
+                    revision,
                 } => {
                     spawn_highlight_worker(
                         root.clone(),
@@ -2505,6 +2972,7 @@ fn spawn_worker(
                         generation,
                         index,
                         file,
+                        revision,
                     );
                 }
                 Task::GitScan {
@@ -2533,6 +3001,7 @@ fn spawn_worker(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_highlight_worker(
     root: PathBuf,
     results: mpsc::SyncSender<WorkResult>,
@@ -2541,12 +3010,17 @@ fn spawn_highlight_worker(
     generation: u64,
     index: usize,
     file: CurrentFile,
+    revision: Option<String>,
 ) {
     thread::spawn(move || {
         let syntaxes = syntaxes.get_or_init(SyntaxSet::load_defaults_newlines);
         let theme =
             theme.get_or_init(|| ThemeSet::load_defaults().themes["base16-ocean.dark"].clone());
-        match read_source(&root, &file) {
+        let source = revision.as_deref().map_or_else(
+            || read_source(&root, &file),
+            |revision| revision_source(&root, revision, &file),
+        );
+        match source {
             Ok(text) => {
                 let _ = results.send(WorkResult::SourcePreview {
                     generation,
@@ -2588,10 +3062,10 @@ fn spawn_highlight_worker(
 }
 
 fn git_scan_result(root: &Path, generation: u64, comparison: GitComparison) -> WorkResult {
-    match scan_git(root, comparison) {
+    match scan_git(root, &comparison) {
         Ok(changes) => WorkResult::GitScan {
             generation,
-            comparison,
+            comparison: comparison.clone(),
             changes,
             unpushed_commits: (comparison == GitComparison::WorkingTree)
                 .then(|| unpushed_commit_count(root))
@@ -2608,10 +3082,11 @@ fn git_scan_result(root: &Path, generation: u64, comparison: GitComparison) -> W
     }
 }
 
-fn git_comparison_index(comparison: GitComparison) -> usize {
+fn git_comparison_index(comparison: &GitComparison) -> usize {
     match comparison {
         GitComparison::WorkingTree => 0,
         GitComparison::Unpushed => 1,
+        GitComparison::Commit { .. } => 2,
     }
 }
 
@@ -3500,6 +3975,340 @@ mod tests {
     }
 
     #[test]
+    fn commit_picker_selects_filters_and_invalidates_old_results() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.files.push(file("previous.rs"));
+        app.cache_source(0, super::plain_source("stale source"));
+        let stale_generation = app.render_generation;
+        let (tasks, queued) = std::sync::mpsc::sync_channel(16);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        let Task::Commits { request } = queued.try_recv().unwrap() else {
+            panic!("expected history request")
+        };
+        let selected = crate::git::GitCommit {
+            oid: "a".repeat(40),
+            parent: "b".repeat(40),
+            date: "2026-09-21".into(),
+            subject: "selected change".into(),
+        };
+        let other = crate::git::GitCommit {
+            oid: "c".repeat(40),
+            subject: "other".into(),
+            ..selected.clone()
+        };
+        app.apply_result(WorkResult::Commits {
+            request,
+            result: Ok(vec![other, selected.clone()]),
+        });
+        assert!(render(&mut app, 100, 20).contains("selected change"));
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('s'),
+            KeyCode::Enter,
+            KeyCode::Enter,
+        ] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &newest, &tasks);
+        }
+        assert_eq!(app.changes_mode, ChangesMode::Commit(selected.clone()));
+        assert_eq!(app.mode, super::Mode::Normal);
+        assert!(app.files.is_empty());
+        assert!(app.source_cache.get(&0).is_none());
+        assert!(
+            matches!(queued.try_recv(), Ok(Task::RevisionScan { revision, .. }) if revision == selected.oid)
+        );
+        app.apply_result(WorkResult::SourcePreview {
+            generation: stale_generation,
+            index: 0,
+            lines: super::plain_source("stale result"),
+        });
+        assert!(app.source_cache.get(&0).is_none());
+        app.apply_result(WorkResult::GitDiff {
+            generation: stale_generation,
+            index: 0,
+            lines: vec![],
+        });
+        assert!(app.git_diff_cache.get(&0).is_none());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.changes_mode, ChangesMode::Git);
+        assert!(matches!(queued.try_recv(), Ok(Task::Scan(_))));
+    }
+
+    fn range_picker() -> App {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.mode = super::Mode::Commits;
+        app.picker.commits = (0..4)
+            .map(|index| crate::git::GitCommit {
+                oid: format!("{index:040x}"),
+                parent: format!("{:040x}", index + 1),
+                date: "2026-09-21".into(),
+                subject: format!("change {index}"),
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn q_returns_to_commit_selection_before_closing_and_can_be_typed_in_filters() {
+        let mut app = range_picker();
+        let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.picker.commit_selection = 2;
+        app.picker.marked_commits.insert(2);
+        app.picker.commit_filter = "change".into();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(!app.handle_key(key(KeyCode::Enter), &newest, &tasks));
+        assert_eq!(app.mode, super::Mode::Normal);
+        assert!(!app.handle_key(key(KeyCode::Char('q')), &newest, &tasks));
+        assert_eq!(app.mode, super::Mode::Commits);
+        assert_eq!(app.picker.commit_selection, 2);
+        assert_eq!(app.picker.commit_filter, "change");
+        assert!(app.picker.marked_commits.contains(&2));
+        app.handle_key(key(KeyCode::Char('/')), &newest, &tasks);
+        assert!(!app.handle_key(key(KeyCode::Char('q')), &newest, &tasks));
+        assert_eq!(app.picker.commit_filter, "changeq");
+        app.handle_key(key(KeyCode::Esc), &newest, &tasks);
+        assert!(app.handle_key(key(KeyCode::Char('q')), &newest, &tasks));
+    }
+
+    #[test]
+    fn checkbox_marks_persist_while_cursor_moves_and_enter_reviews_only_marks() {
+        for count in [1, 2] {
+            let mut app = range_picker();
+            let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            assert_eq!(render(&mut app, 100, 20).matches("[x]").count(), 0);
+            for _ in 0..count {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+            }
+            assert_eq!(app.selected_commit_rows(), (0..count).collect());
+            assert_eq!(render(&mut app, 100, 20).matches("[x]").count(), count);
+            // Toggle the cursor's checkbox on and off; previous marks remain.
+            for _ in 0..2 {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+            }
+            assert_eq!(app.selected_commit_rows(), (0..count).collect());
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            assert_eq!(
+                app.changes_mode.comparison(),
+                GitComparison::Commit {
+                    base: format!("{count:040x}"),
+                    tip: format!("{:040x}", 0),
+                }
+            );
+            assert!(
+                matches!(queued.try_recv(), Ok(Task::RevisionScan { revision, .. }) if revision == format!("{:040x}", 0))
+            );
+        }
+    }
+
+    #[test]
+    fn checkbox_selection_can_be_cleared_or_replaced_by_shift_range() {
+        let mut app = range_picker();
+        let (tasks, _) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.selected_commit_rows(), [1, 2].into_iter().collect());
+        assert!(app.picker.marked_commits.is_empty());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.selected_commit_rows(), [1].into_iter().collect());
+        assert!(app.picker.selection_anchor.is_none());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert!(app.selected_commit_rows().is_empty());
+    }
+
+    #[test]
+    fn shift_arrows_extend_shrink_cross_anchor_and_plain_arrows_clear_range() {
+        let mut app = range_picker();
+        let (tasks, _) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.picker.commit_selection = 1;
+        for (code, expected) in [
+            (KeyCode::Down, 1..=2),
+            (KeyCode::Down, 1..=3),
+            (KeyCode::Up, 1..=2),
+            (KeyCode::Up, 1..=1),
+            (KeyCode::Up, 0..=1),
+        ] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::SHIFT), &newest, &tasks);
+            assert_eq!(app.commit_selection_range(), expected);
+        }
+        let output = render(&mut app, 100, 20);
+        assert!(output.contains("2 selected"));
+        assert_eq!(output.matches("[x]").count(), 2);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.commit_selection_range(), 1..=1);
+        assert_eq!(app.picker.selection_anchor, None);
+    }
+
+    #[test]
+    fn enter_combines_range_in_both_directions_and_browses_newest_tree() {
+        for upwards in [false, true] {
+            let mut app = range_picker();
+            let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            app.picker.commit_selection = if upwards { 2 } else { 0 };
+            let arrow = if upwards { KeyCode::Up } else { KeyCode::Down };
+            for _ in 0..2 {
+                app.handle_key(KeyEvent::new(arrow, KeyModifiers::SHIFT), &newest, &tasks);
+            }
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            assert_eq!(app.mode, super::Mode::Normal);
+            assert_eq!(
+                app.changes_mode.comparison(),
+                GitComparison::Commit {
+                    base: format!("{:040x}", 3),
+                    tip: format!("{:040x}", 0),
+                }
+            );
+            assert!(
+                matches!(app.changes_mode, ChangesMode::CommitRange(ref range) if range.count == 3)
+            );
+            assert!(
+                matches!(queued.try_recv(), Ok(Task::RevisionScan { revision, .. }) if revision == format!("{:040x}", 0))
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_clears_range_and_nonconsecutive_selection_keeps_picker_open() {
+        let mut app = range_picker();
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            &newest,
+            &tasks,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.picker.selection_anchor, None);
+        app.picker.commits[0].subject = "match".into();
+        app.picker.commits[2].subject = "match".into();
+        app.picker.commit_filter = "match".into();
+        app.picker.commit_filtering = false;
+        app.picker.commit_selection = 0;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            &newest,
+            &tasks,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.mode, super::Mode::Commits);
+        assert_eq!(app.changes_mode, ChangesMode::Git);
+        assert!(
+            app.picker
+                .selection_error
+                .as_deref()
+                .unwrap()
+                .contains("consecutive commits")
+        );
+        assert!(queued.try_recv().is_err());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert!(app.picker.selection_error.is_none());
+    }
+
+    #[test]
+    fn cancelling_commit_picker_preserves_comparison_and_copy_shortcut() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert!(matches!(queued.try_recv(), Ok(Task::Commits { .. })));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.mode, super::Mode::Normal);
+        assert_eq!(app.changes_mode, ChangesMode::Git);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &newest,
+            &tasks,
+        );
+        assert_ne!(app.mode, super::Mode::Commits);
+        assert!(
+            !queued
+                .try_iter()
+                .any(|task| matches!(task, Task::Commits { .. }))
+        );
+    }
+
+    #[test]
     fn changes_start_in_git_mode_and_g_toggles_to_unpushed() {
         let mut app = App::new("w1:p1".into());
         app.loading = false;
@@ -3945,6 +4754,161 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_selects_folders_toggles_them_and_skips_collapsed_children() {
+        for tab in [Tab::Files, Tab::Changes] {
+            let mut app = App::new("w1:p1".into());
+            app.loading = false;
+            app.git_state = super::GitState::Loaded;
+            app.tab = tab;
+            app.viewport = Rect::new(0, 0, 100, 20);
+            app.files = vec![file("src/a.rs"), file("src/b.rs"), file("tests/c.rs")];
+            app.git_changes = vec![
+                git_change("src/a.rs", ChangeKind::Modified),
+                git_change("src/b.rs", ChangeKind::Modified),
+                git_change("tests/c.rs", ChangeKind::Added),
+            ];
+            let (tasks, _queued) = std::sync::mpsc::sync_channel(32);
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            let initial_len = app.navigation_rows().len();
+            app.handle_key(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            let selected = app.selected_navigation_row(&app.navigation_rows()).unwrap();
+            assert!(
+                matches!(&app.navigation_rows()[selected], super::NavigationRow::Group { label, .. } if label == "src/")
+            );
+            assert!(
+                render(&mut app, 100, 20)
+                    .lines()
+                    .any(|line| line.contains('▎') && line.contains("src/"))
+            );
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            assert_eq!(app.navigation_rows().len(), initial_len - 2);
+            assert_eq!(
+                app.selected_navigation_row(&app.navigation_rows()),
+                Some(selected)
+            );
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            assert_eq!(app.navigation_rows().len(), initial_len);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            app.handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            let row = app.selected_navigation_row(&app.navigation_rows()).unwrap();
+            assert!(
+                matches!(&app.navigation_rows()[row], super::NavigationRow::Group { label, .. } if label == "tests/")
+            );
+            app.handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            assert_eq!(app.actual_selected(), Some(2));
+            assert!(app.active_state().navigation_group.is_none());
+        }
+    }
+
+    #[test]
+    fn repeated_folder_headers_keep_the_selected_occurrence() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("src/a.rs"), file("src/nested/b.rs"), file("src/z.rs")];
+        let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        for _ in 0..3 {
+            app.move_vertical(1);
+        }
+        assert_eq!(app.selected_navigation_row(&app.navigation_rows()), Some(4));
+        assert_eq!(app.files_state.navigation_group, Some(("src".into(), 1)));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.selected_navigation_row(&app.navigation_rows()), Some(3));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.selected_navigation_row(&app.navigation_rows()), Some(4));
+        app.move_vertical(-1);
+        assert_eq!(app.actual_selected(), Some(1));
+    }
+
+    #[test]
+    fn keyboard_scrolls_tree_to_keep_folders_and_files_visible() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.viewport = Rect::new(0, 0, 100, 8);
+        app.files = (0..20)
+            .map(|index| file(&format!("folder{index:02}/file.rs")))
+            .collect();
+        let area = app.ui_layout(app.viewport).navigation.unwrap();
+        let height = usize::from(super::bordered_inner(area).height);
+        for delta in std::iter::repeat_n(1, 35).chain(std::iter::repeat_n(-1, 35)) {
+            app.move_vertical(delta);
+            let row = app.selected_navigation_row(&app.navigation_rows()).unwrap();
+            let offset = app.navigation_scroll_offset(area);
+            assert!(row >= offset && row < offset + height);
+        }
+    }
+
+    #[test]
+    fn mouse_folder_selection_can_be_reopened_with_enter() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.viewport = Rect::new(0, 0, 100, 20);
+        app.files = vec![file("src/a.rs"), file("src/b.rs")];
+        let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        let area = app.ui_layout(app.viewport).navigation.unwrap();
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 2,
+                area.y + 1,
+            ),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.navigation_rows().len(), 1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.navigation_rows().len(), 3);
+        // Enter in the code pane must not collapse the selected folder.
+        app.focus = Focus::Content;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.navigation_rows().len(), 3);
+    }
+
+    #[test]
     fn each_tab_preserves_filter_selection_and_scroll() {
         let mut app = App::new("w1:p1".into());
         app.changes_state.filter = "src".into();
@@ -4224,6 +5188,144 @@ mod tests {
 
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 35, 3), &newest, &tasks);
         assert_eq!(app.files_state.scroll_y, 3);
+    }
+
+    fn scroll_boundary_app(tab: Tab) -> App {
+        use std::fmt::Write as _;
+
+        let mut app = App::new("w1:p1".into());
+        app.tab = tab;
+        app.loading = false;
+        app.git_state = super::GitState::Loaded;
+        app.focus = Focus::Content;
+        app.viewport = Rect::new(0, 0, 100, 20);
+        app.files = vec![file("src/main.rs")];
+        app.git_changes = vec![git_change("src/main.rs", ChangeKind::Modified)];
+        let mut text = String::new();
+        for line in 0..80 {
+            writeln!(text, "{line:03} {}", "x".repeat(160)).unwrap();
+        }
+        app.cache_source(0, super::plain_source(&text));
+        app.git_diff_cache.insert(
+            0,
+            text.lines()
+                .enumerate()
+                .map(|(index, text)| DiffLine {
+                    kind: DiffLineKind::Addition,
+                    text: format!("+{text}"),
+                    old_line: None,
+                    new_line: Some(index + 1),
+                })
+                .collect(),
+            text.len(),
+        );
+        app
+    }
+
+    #[test]
+    fn mouse_scrolling_past_file_edges_reverses_immediately() {
+        for tab in [Tab::Changes, Tab::Files] {
+            for horizontal in [false, true] {
+                let mut app = scroll_boundary_app(tab);
+                let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+                let newest = std::sync::atomic::AtomicU64::new(1);
+                let content = app.ui_layout(app.viewport).content.unwrap();
+                let metrics = app.content_scrollbar_metrics(content, 0).unwrap();
+                let maximum = if horizontal {
+                    metrics.horizontal.unwrap().max_scroll
+                } else {
+                    metrics.vertical.unwrap().max_scroll
+                };
+                let forward = if horizontal {
+                    MouseEventKind::ScrollRight
+                } else {
+                    MouseEventKind::ScrollDown
+                };
+                let backward = if horizontal {
+                    MouseEventKind::ScrollLeft
+                } else {
+                    MouseEventKind::ScrollUp
+                };
+                for _ in 0..100 {
+                    app.handle_mouse(
+                        mouse(forward, content.x + 2, content.y + 2),
+                        &newest,
+                        &tasks,
+                    );
+                    render(&mut app, 100, 20);
+                }
+                let scroll = if horizontal {
+                    app.active_state().scroll_x
+                } else {
+                    app.active_state().scroll_y
+                };
+                assert_eq!(
+                    scroll, maximum,
+                    "stored position must stop at the edge: {tab:?}, horizontal={horizontal}"
+                );
+                let at_end = render(&mut app, 100, 20);
+                app.handle_mouse(
+                    mouse(backward, content.x + 2, content.y + 2),
+                    &newest,
+                    &tasks,
+                );
+                let reversed = render(&mut app, 100, 20);
+                assert_ne!(
+                    at_end, reversed,
+                    "one reverse wheel event must move the view"
+                );
+                let scroll = if horizontal {
+                    app.active_state().scroll_x
+                } else {
+                    app.active_state().scroll_y
+                };
+                assert_eq!(scroll, maximum.saturating_sub(3));
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_scrolling_and_resize_clamp_diff_and_source_offsets() {
+        for tab in [Tab::Changes, Tab::Files] {
+            let mut app = scroll_boundary_app(tab);
+            let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            let content = app.ui_layout(app.viewport).content.unwrap();
+            let metrics = app.content_scrollbar_metrics(content, 0).unwrap();
+            let max_y = metrics.vertical.unwrap().max_scroll;
+            let max_x = metrics.horizontal.unwrap().max_scroll;
+            for _ in 0..100 {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+                render(&mut app, 100, 20);
+            }
+            assert_eq!(app.active_state().scroll_y, max_y);
+            assert_eq!(app.active_state().scroll_x, max_x);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            app.handle_key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            render(&mut app, 100, 20);
+            assert_eq!(app.active_state().scroll_y, max_y - 1);
+            assert_eq!(app.active_state().scroll_x, max_x - 4);
+            render(&mut app, 400, 120);
+            assert_eq!(app.active_state().scroll_y, 0);
+            assert_eq!(app.active_state().scroll_x, 0);
+        }
     }
 
     #[test]
