@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use herdr_agent_diff::Result;
 use herdr_agent_diff::context::PluginContext;
-use herdr_agent_diff::herdr::{Herdr, open_or_focus, open_or_focus_tab};
+use herdr_agent_diff::herdr::{Herdr, open_or_focus, open_or_focus_tab, pane_exists};
 use herdr_agent_diff::state::{StateStore, ViewerMapping};
 use tempfile::TempDir;
 
@@ -19,15 +19,26 @@ impl Herdr for FakeHerdr {
         self.calls.lock().expect("calls").push(arguments.to_vec());
         let is_get = arguments.first().is_some_and(|value| value == "pane")
             && arguments.get(1).is_some_and(|value| value == "get");
-        let success = !is_get || self.pane_exists;
+        let is_focus = arguments.get(2).is_some_and(|value| value == "focus");
+        let success = if is_get {
+            arguments.get(2).is_some_and(|value| value == "w1:p1") || self.pane_exists
+        } else {
+            !is_focus || self.pane_exists
+        };
         Ok(Output {
             status: ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
             stdout: if success {
-                br#"{"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}}"#.to_vec()
+                br#"{"result":{"pane":{"foreground_cwd":"/tmp/project"},"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}}"#.to_vec()
             } else {
                 Vec::new()
             },
-            stderr: Vec::new(),
+            stderr: if success {
+                Vec::new()
+            } else if is_focus {
+                br#"{"error":{"code":"plugin_pane_not_found"}}"#.to_vec()
+            } else {
+                br#"{"error":{"code":"pane_not_found"}}"#.to_vec()
+            },
         })
     }
 }
@@ -112,7 +123,7 @@ fn open_uses_exact_documented_plugin_pane_arguments() {
     };
     open_or_focus(&herdr, &store, &context()).expect("open");
     assert_eq!(
-        herdr.calls.lock().expect("calls")[0],
+        herdr.calls.lock().expect("calls")[1],
         [
             "plugin",
             "pane",
@@ -135,7 +146,7 @@ fn open_uses_exact_documented_plugin_pane_arguments() {
         ]
     );
     assert_eq!(
-        herdr.calls.lock().expect("calls")[1],
+        herdr.calls.lock().expect("calls")[2],
         ["pane", "zoom", "w1:p2", "--on"]
     );
 }
@@ -150,7 +161,7 @@ fn open_tab_uses_tab_placement_and_keeps_split_opening_available() {
     };
     open_or_focus_tab(&herdr, &store, &context()).expect("open tab");
     assert_eq!(
-        herdr.calls.lock().expect("calls")[0],
+        herdr.calls.lock().expect("calls")[1],
         [
             "plugin",
             "pane",
@@ -228,9 +239,8 @@ fn open_focuses_live_viewer_and_replaces_stale_mapping() {
     };
     open_or_focus(&live, &store, &context()).expect("focus");
     let calls = live.calls.lock().expect("calls");
-    assert_eq!(calls[0], ["pane", "get", "w1:p2"]);
-    assert_eq!(calls[1], ["plugin", "pane", "focus", "w1:p2"]);
-    assert_eq!(calls[2], ["pane", "zoom", "w1:p2", "--on"]);
+    assert_eq!(calls[0], ["plugin", "pane", "focus", "w1:p2"]);
+    assert_eq!(calls[1], ["pane", "zoom", "w1:p2", "--on"]);
     drop(calls);
 
     let missing_viewer = FakeHerdr {
@@ -246,4 +256,53 @@ fn open_focuses_live_viewer_and_replaces_stale_mapping() {
             .iter()
             .any(|call| call.get(2).is_some_and(|value| value == "open"))
     );
+}
+
+#[test]
+fn opening_from_a_restored_viewer_uses_original_source_and_live_directory() {
+    let state = TempDir::new().expect("state");
+    let store = StateStore::new(state.path()).expect("store");
+    store
+        .set_viewer_mapping(&ViewerMapping {
+            target_pane_id: "w1:p1".into(),
+            viewer_pane_id: "w1:p2".into(),
+        })
+        .expect("mapping");
+    let herdr = FakeHerdr {
+        calls: Mutex::new(Vec::new()),
+        pane_exists: false,
+    };
+    let mut restored = context();
+    restored.pane_id = Some("w1:p2".into());
+    restored.cwd = Some("/tmp/plugin-installation".into());
+    open_or_focus(&herdr, &store, &restored).expect("recover restored viewer");
+    let calls = herdr.calls.lock().expect("calls");
+    assert_eq!(calls[0], ["plugin", "pane", "focus", "w1:p2"]);
+    assert_eq!(calls[1], ["pane", "get", "w1:p1"]);
+    let open = &calls[2];
+    assert!(
+        open.windows(2)
+            .any(|pair| pair == ["--target-pane", "w1:p1"])
+    );
+    assert!(
+        open.iter()
+            .any(|arg| arg == "HERDR_AGENT_DIFF_ROOT=/tmp/project")
+    );
+    assert!(!open.iter().any(|arg| arg.contains("plugin-installation")));
+}
+
+#[test]
+fn liveness_distinguishes_a_missing_pane_from_a_transient_failure() {
+    struct FailingHerdr;
+    impl Herdr for FailingHerdr {
+        fn output(&self, _: &[String]) -> Result<Output> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+        }
+    }
+    let missing = FakeHerdr {
+        calls: Mutex::new(Vec::new()),
+        pane_exists: false,
+    };
+    assert!(!pane_exists(&missing, "w1:p2").expect("missing pane"));
+    assert!(pane_exists(&FailingHerdr, "w1:p2").is_err());
 }

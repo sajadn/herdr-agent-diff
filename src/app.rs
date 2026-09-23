@@ -458,7 +458,7 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
             dirty_since = None;
         }
         if last_liveness.elapsed() >= Duration::from_secs(2) {
-            if !pane_exists(herdr, &app.target_pane_id) {
+            if matches!(pane_exists(herdr, &app.target_pane_id), Ok(false)) {
                 break;
             }
             last_liveness = Instant::now();

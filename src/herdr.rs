@@ -30,10 +30,15 @@ impl Herdr for ProcessHerdr {
     }
 }
 
-pub fn pane_exists(herdr: &impl Herdr, pane_id: &str) -> bool {
-    herdr
-        .output(&["pane".into(), "get".into(), pane_id.into()])
-        .is_ok_and(|output| output.status.success())
+pub fn pane_exists(herdr: &impl Herdr, pane_id: &str) -> Result<bool> {
+    let output = herdr.output(&["pane".into(), "get".into(), pane_id.into()])?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if has_error_code(&output, "pane_not_found") {
+        return Ok(false);
+    }
+    Err(command_error(&output))
 }
 
 pub fn pane_info(herdr: &impl Herdr, pane_id: &str) -> Result<Value> {
@@ -95,28 +100,39 @@ fn open_or_focus_at(
     context: &PluginContext,
     placement: ViewerPlacement,
 ) -> Result<()> {
-    let target = context
+    let invoking = context
         .pane_id
         .as_deref()
         .ok_or_else(|| Error::Message("Herdr did not provide an invoking pane".into()))?;
+    // Restored panes keep their IDs but lose their plugin process. Resolve the
+    // original source even when the shortcut is invoked from the old viewer.
+    let source = store.mapping_for_viewer(invoking)?;
+    let target = source
+        .as_ref()
+        .map_or(invoking, |mapping| mapping.target_pane_id.as_str());
     if let Some(mapping) = store.viewer_mapping_for(target, placement)? {
-        if pane_exists(herdr, &mapping.viewer_pane_id) {
-            checked(
-                herdr,
-                &[
-                    "plugin".into(),
-                    "pane".into(),
-                    "focus".into(),
-                    mapping.viewer_pane_id.clone(),
-                ],
-            )?;
+        let output = herdr.output(&[
+            "plugin".into(),
+            "pane".into(),
+            "focus".into(),
+            mapping.viewer_pane_id.clone(),
+        ])?;
+        if output.status.success() {
             if placement == ViewerPlacement::Split {
                 zoom_viewer(herdr, &mapping.viewer_pane_id)?;
             }
             return Ok(());
         }
+        if !has_error_code(&output, "plugin_pane_not_found")
+            && !has_error_code(&output, "pane_not_found")
+        {
+            return Err(command_error(&output));
+        }
         store.remove_viewer_mapping_for(target, placement)?;
     }
+    // The live source pane is authoritative; callback cwd can be the plugin's
+    // installation directory, especially after session restoration.
+    let root = pane_root(herdr, target)?;
     let mut arguments = vec![
         "plugin".into(),
         "pane".into(),
@@ -137,7 +153,7 @@ fn open_or_focus_at(
             "--env".into(),
             format!("HERDR_AGENT_DIFF_TARGET_PANE={target}"),
         ]);
-        add_root_environment(&mut arguments, context.cwd.as_deref());
+        add_root_environment(&mut arguments, Some(&root));
         arguments.push("--focus".into());
     } else {
         let workspace = context
@@ -152,7 +168,7 @@ fn open_or_focus_at(
             "--env".into(),
             format!("HERDR_AGENT_DIFF_VIEWER_PLACEMENT={}", placement.as_str()),
         ]);
-        add_root_environment(&mut arguments, context.cwd.as_deref());
+        add_root_environment(&mut arguments, Some(&root));
         arguments.push("--focus".into());
     }
     let response = checked(herdr, &arguments)?;
@@ -206,10 +222,19 @@ pub fn register_viewer_for(
 fn checked(herdr: &impl Herdr, arguments: &[String]) -> Result<Value> {
     let output = herdr.output(arguments)?;
     if !output.status.success() {
-        return Err(Error::Message(format!(
-            "Herdr command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        return Err(command_error(&output));
     }
     serde_json::from_slice(&output.stdout).map_err(Into::into)
+}
+
+fn has_error_code(output: &Output, code: &str) -> bool {
+    serde_json::from_slice::<Value>(&output.stderr)
+        .is_ok_and(|value| value.pointer("/error/code").and_then(Value::as_str) == Some(code))
+}
+
+fn command_error(output: &Output) -> Error {
+    Error::Message(format!(
+        "Herdr command failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }

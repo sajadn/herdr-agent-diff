@@ -161,6 +161,10 @@ description = "Git changes in tab"
 
 `Ctrl+A`, then `d` opens the viewer full-screen within the tab. `Ctrl+A`, then `z` toggles between the viewer and the split layout. Press `q` to return to the commit picker, then `q` again to close the viewer and return to the terminal. These bindings assume the prefix is set to `ctrl+a`.
 
+The open shortcut also works from inside the viewer. After a Herdr server restart,
+it replaces stale viewer mappings and resolves the original source pane. The
+viewer runs from the repository directory so a restored shell keeps that directory.
+
 ### 🔄 Changes tab
 
 The sidebar is organized by folders. Press Tab to focus it, then use Up/Down or `j`/`k` to select folders or files. Press Enter on a folder to expand or collapse it, or click it with the mouse. Collapsed files are skipped by keyboard navigation. Select a file to inspect its diff. Press `b` to hide or show the sidebar.

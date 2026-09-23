@@ -20,11 +20,11 @@ impl PluginContext {
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
 
         let values = [event.as_ref(), context.as_ref()];
-        let pane_id = find_string(&values, &["pane_id", "target_pane_id"])
+        let pane_id = find_string(&values, &["pane_id", "target_pane_id", "focused_pane_id"])
             .or_else(|| std::env::var("HERDR_PANE_ID").ok());
         let workspace_id = find_string(&values, &["workspace_id"])
             .or_else(|| std::env::var("HERDR_WORKSPACE_ID").ok());
-        let cwd = find_string(&values, &["foreground_cwd", "cwd"])
+        let cwd = find_string(&values, &["foreground_cwd", "cwd", "focused_pane_cwd"])
             .or_else(|| std::env::var("HERDR_ACTIVE_PANE_CWD").ok())
             .map(PathBuf::from);
         Self {
@@ -71,5 +71,23 @@ mod tests {
         });
         let values = [Some(&event)];
         assert_eq!(find_string(&values, &["pane_id"]).as_deref(), Some("w1:p2"));
+    }
+
+    #[test]
+    fn recognizes_current_focused_pane_context_fields() {
+        let context = json!({
+            "focused_pane_id": "w2:p3",
+            "focused_pane_cwd": "/tmp/repository",
+            "workspace_cwd": "/tmp/other-repository",
+        });
+        let values = [Some(&context)];
+        assert_eq!(
+            find_string(&values, &["pane_id", "target_pane_id", "focused_pane_id"]).as_deref(),
+            Some("w2:p3")
+        );
+        assert_eq!(
+            find_string(&values, &["foreground_cwd", "cwd", "focused_pane_cwd"]).as_deref(),
+            Some("/tmp/repository")
+        );
     }
 }

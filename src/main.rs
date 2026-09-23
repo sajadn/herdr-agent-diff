@@ -1,8 +1,7 @@
 use herdr_agent_diff::app;
 use herdr_agent_diff::context::PluginContext;
 use herdr_agent_diff::herdr::{
-    Herdr, ProcessHerdr, open_or_focus, open_or_focus_tab, pane_left_neighbor, pane_root,
-    register_viewer_for,
+    Herdr, ProcessHerdr, open_or_focus, open_or_focus_tab, pane_root, register_viewer_for,
 };
 use herdr_agent_diff::state::StateStore;
 use herdr_agent_diff::{Error, Result, state_dir};
@@ -54,22 +53,13 @@ fn handle_open_tab(store: &StateStore) -> Result<()> {
 }
 
 fn handle_view(store: &StateStore) -> Result<()> {
-    let requested_target = env::var("HERDR_AGENT_DIFF_TARGET_PANE")
+    let target = env::var("HERDR_AGENT_DIFF_TARGET_PANE")
         .map_err(|_| Error::Message("viewer target pane is unavailable".into()))?;
-    let viewer_pane_id = env::var("HERDR_PANE_ID")
-        .map_err(|_| Error::Message("viewer pane id is unavailable".into()))?;
     let placement = match env::var("HERDR_AGENT_DIFF_VIEWER_PLACEMENT").as_deref() {
         Ok("tab") => herdr_agent_diff::state::ViewerPlacement::Tab,
         _ => herdr_agent_diff::state::ViewerPlacement::Split,
     };
     let herdr = ProcessHerdr::from_env();
-    let target = match placement {
-        herdr_agent_diff::state::ViewerPlacement::Split => {
-            pane_left_neighbor(&herdr, &viewer_pane_id)?
-                .ok_or_else(|| Error::Message("viewer has no agent pane on its left".into()))?
-        }
-        herdr_agent_diff::state::ViewerPlacement::Tab => requested_target,
-    };
     register_viewer_for(store, &target, placement)?;
     let _mapping_guard = MappingGuard {
         store: store.clone(),
@@ -77,6 +67,8 @@ fn handle_view(store: &StateStore) -> Result<()> {
         placement,
     };
     let root = viewer_root(&herdr, &target)?;
+    // Herdr persists the foreground cwd when recreating panes after a restart.
+    env::set_current_dir(&root)?;
     app::run(&root, target, &herdr)
 }
 

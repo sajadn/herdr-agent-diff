@@ -72,6 +72,22 @@ impl StateStore {
         self.viewer_mapping_for(target_pane_id, ViewerPlacement::Split)
     }
 
+    pub fn mapping_for_viewer(&self, viewer_pane_id: &str) -> Result<Option<ViewerMapping>> {
+        for entry in fs::read_dir(self.root.join("viewers"))? {
+            let entry = entry?;
+            let Ok(bytes) = fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(mapping) = serde_json::from_slice::<ViewerMapping>(&bytes) else {
+                continue;
+            };
+            if mapping.viewer_pane_id == viewer_pane_id {
+                return Ok(Some(mapping));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn viewer_mapping_for(
         &self,
         target_pane_id: &str,
