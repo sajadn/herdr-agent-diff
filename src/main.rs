@@ -69,7 +69,7 @@ fn handle_view(store: &StateStore) -> Result<()> {
     let root = viewer_root(&herdr, &target)?;
     // Herdr persists the foreground cwd when recreating panes after a restart.
     env::set_current_dir(&root)?;
-    app::run(&root, target, &herdr)
+    app::run(&root, target, herdr)
 }
 
 fn viewer_root(herdr: &impl Herdr, target: &str) -> Result<std::path::PathBuf> {

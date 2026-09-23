@@ -16,3 +16,20 @@ Interactive work is kept off the input/render loop by the bounded worker in
 `src/app.rs`. Snapshot generations discard obsolete scan results, filesystem
 bursts are debounced for 150 ms, and rendered content is retained in a
 32 MiB byte-bounded cache.
+
+## Remote Linux interaction check
+
+On 2026-09-23, a 240-column by 60-row PTY running a warmed historical Files
+view on a Linux login node gave these before/after measurements:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Viewer CPU over a 3-second idle interval (one core = 100%) | 5.67% | 0.33% |
+| Process 100 queued Down keys and exit through the commit picker | 0.200 s | 0.089 s |
+
+These are single-run viewer-process measurements, not end-to-end SSH latency.
+The event loop now redraws after state changes instead of every 50 ms, batches
+scroll events (at most 32 events or 8 ms), and checks source-pane liveness on the
+worker thread. Stored scroll offsets are clamped after each event so batching
+does not reintroduce overscroll at file boundaries. Working-tree notifications
+also no longer refresh immutable commit reviews.

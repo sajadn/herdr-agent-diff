@@ -265,6 +265,7 @@ type DiffView<'a> = (
 );
 
 enum Task {
+    CheckTarget(String),
     Scan(u64),
     RevisionScan {
         generation: u64,
@@ -298,6 +299,7 @@ struct ScanResult {
 }
 
 enum WorkResult {
+    TargetExists(Result<bool>),
     Commits {
         request: u64,
         result: std::result::Result<Vec<GitCommit>, String>,
@@ -395,7 +397,8 @@ impl<K: Eq, V> Cache<K, V> {
     }
 }
 
-pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+pub fn run(root: &Path, target_pane_id: String, herdr: impl Herdr + Send + 'static) -> Result<()> {
     let canonical_root = root.canonicalize()?;
     let (watch_tx, watch_rx) = mpsc::channel();
     let polling_watcher = should_use_polling_watcher();
@@ -421,6 +424,7 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
         Arc::clone(&newest_generation),
         task_rx,
         result_tx,
+        herdr,
     );
     task_tx
         .send(Task::Scan(1))
@@ -433,11 +437,18 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
     }
     let mut dirty_since: Option<Instant> = None;
     let mut last_liveness = Instant::now();
+    let mut needs_redraw = true;
 
     loop {
         while let Ok(result) = result_rx.try_recv() {
+            let result = match result {
+                WorkResult::TargetExists(Ok(false)) => return Ok(()),
+                WorkResult::TargetExists(_) => continue,
+                result => result,
+            };
             app.apply_result(result);
             app.request_selected(&task_tx);
+            needs_redraw = true;
         }
         app.request_selected(&task_tx);
         while let Ok(event) = watch_rx.try_recv() {
@@ -449,31 +460,60 @@ pub fn run(root: &Path, target_pane_id: String, herdr: &impl Herdr) -> Result<()
                     app.notices
                         .push(format!("watcher error: {error}; press r to recover"));
                     dirty_since = Some(Instant::now());
+                    needs_redraw = true;
                 }
             }
         }
-        if dirty_since.is_some_and(|instant| instant.elapsed() >= Duration::from_millis(150))
+        // Working-tree writes cannot change the contents of a selected commit.
+        if app.revision().is_some() {
+            dirty_since = None;
+        } else if dirty_since.is_some_and(|instant| instant.elapsed() >= Duration::from_millis(150))
             && app.refresh(&newest_generation, &task_tx)
         {
             dirty_since = None;
+            needs_redraw = true;
         }
-        if last_liveness.elapsed() >= Duration::from_secs(2) {
-            if matches!(pane_exists(herdr, &app.target_pane_id), Ok(false)) {
-                break;
-            }
+        if last_liveness.elapsed() >= Duration::from_secs(2)
+            && task_tx
+                .try_send(Task::CheckTarget(app.target_pane_id.clone()))
+                .is_ok()
+        {
             last_liveness = Instant::now();
         }
 
-        terminal.draw(|frame| app.draw(frame))?;
+        if needs_redraw {
+            terminal.draw(|frame| app.draw(frame))?;
+            needs_redraw = false;
+        }
         if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if app.handle_key(key, &newest_generation, &task_tx) => break,
-                Event::Mouse(mouse) => app.handle_mouse(mouse, &newest_generation, &task_tx),
-                _ => {}
+            // Drain short scroll bursts before rendering instead of drawing every
+            // intermediate row. Bound the batch so results and redraws stay timely.
+            let deadline = Instant::now() + Duration::from_millis(8);
+            for _ in 0..32 {
+                let input = event::read()?;
+                let scroll = app.is_scroll_input(&input);
+                match input {
+                    Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                        if app.handle_key(key, &newest_generation, &task_tx) {
+                            return Ok(());
+                        }
+                        needs_redraw = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        app.handle_mouse(mouse, &newest_generation, &task_tx);
+                        needs_redraw = true;
+                    }
+                    Event::Resize(_, _) | Event::FocusGained => needs_redraw = true,
+                    _ => {}
+                }
+                // Preserve immediate reverse scrolling at EOF within a batch.
+                app.clamp_content_scroll(app.ui_layout(app.viewport).content);
+                if !scroll || Instant::now() >= deadline || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
     }
-    Ok(())
 }
 
 enum WatchMessage {
@@ -743,6 +783,32 @@ struct App {
 }
 
 impl App {
+    fn is_scroll_input(&self, input: &Event) -> bool {
+        match input {
+            Event::Mouse(mouse) => matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            ),
+            Event::Key(key) if self.mode == Mode::Normal && self.focus == Focus::Content => {
+                matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::Char('j' | 'k' | 'h' | 'l')
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn new(target_pane_id: String) -> Self {
         Self {
             tab: Tab::Changes,
@@ -2895,12 +2961,16 @@ fn spawn_worker(
     newest_generation: Arc<AtomicU64>,
     tasks: mpsc::Receiver<Task>,
     results: mpsc::SyncSender<WorkResult>,
+    herdr: impl Herdr + Send + 'static,
 ) {
     thread::spawn(move || {
         let syntaxes = Arc::new(OnceLock::<SyntaxSet>::new());
         let theme = Arc::new(OnceLock::<Theme>::new());
         while let Ok(task) = tasks.recv() {
             match task {
+                Task::CheckTarget(pane_id) => {
+                    let _ = results.send(WorkResult::TargetExists(pane_exists(&herdr, &pane_id)));
+                }
                 Task::Commits { request } => {
                     let root = root.clone();
                     let results = results.clone();
@@ -5223,7 +5293,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_scrolling_past_file_edges_reverses_immediately() {
+    fn mouse_scroll_bursts_reverse_at_file_edges_without_intermediate_draws() {
         for tab in [Tab::Changes, Tab::Files] {
             for horizontal in [false, true] {
                 let mut app = scroll_boundary_app(tab);
@@ -5252,7 +5322,7 @@ mod tests {
                         &newest,
                         &tasks,
                     );
-                    render(&mut app, 100, 20);
+                    app.clamp_content_scroll(Some(content));
                 }
                 let scroll = if horizontal {
                     app.active_state().scroll_x
