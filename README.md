@@ -198,6 +198,11 @@ against an empty tree. Files browses the complete source tree at the chosen comm
 including files that have since been changed or deleted. Binary and oversized
 files keep the existing preview limits. Nothing is checked out, staged, or reset.
 
+Press `w` from the commit picker or either review tab to view current working-tree
+changes, including unstaged, staged, and untracked files. This refreshes the local
+diff and switches Files back to the current working tree. While filtering, `w`
+is typed into the filter; press Esc first to use the shortcut.
+
 Press `q` to return to the commit picker with your previous position and selection,
 or `c` to refresh the commit list. Press `g` in Changes to return to local
 Git changes and working files. A range compares the oldest selected commit's
@@ -219,6 +224,7 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `b` | Hide or show the sidebar. |
 | `g` | Toggle Git diff and Unpushed commits modes; leave commit review. |
 | `c` | Pick a commit from the history of HEAD. |
+| `w` | Open working-tree changes (unstaged, staged, and untracked), including from the commit picker. |
 | `Tab` | Move focus between the sidebar and diff/content pane. |
 | Arrow keys, `h`/`j`/`k`/`l` | Navigate the focused area. |
 | `Enter` | Open a selected file or toggle a selected folder. |

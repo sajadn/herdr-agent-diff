@@ -1174,6 +1174,25 @@ impl App {
         }
     }
 
+    fn open_working_tree(&mut self, newest: &AtomicU64, tasks: &mpsc::SyncSender<Task>) {
+        let previous = self.changes_mode.clone();
+        self.changes_mode = ChangesMode::Git;
+        if self.reset_source(newest, tasks) {
+            self.tab = Tab::Changes;
+            self.focus = Focus::Navigation;
+            self.mode = Mode::Normal;
+            self.picker.selection_error = None;
+        } else {
+            self.changes_mode = previous;
+            let error = "Worker busy; press w to retry.".to_owned();
+            if self.mode == Mode::Commits {
+                self.picker.selection_error = Some(error);
+            } else {
+                self.git_error = Some(error);
+            }
+        }
+    }
+
     fn filtered_commits(&self) -> Vec<usize> {
         let needle = self.picker.commit_filter.to_lowercase();
         self.picker
@@ -1260,6 +1279,7 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('w') if key.modifiers.is_empty() => self.open_working_tree(newest, tasks),
             KeyCode::Char(' ' | 'x') if !self.picker.commits_loading && !filtered.is_empty() => {
                 if self.picker.selection_anchor.is_some() {
                     self.picker.marked_commits = self.commit_selection_range().collect();
@@ -1361,7 +1381,8 @@ impl App {
         let count = selection.len();
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Pick commits — {count} selected "));
+            .title(format!(" Pick commits — {count} selected "))
+            .title_bottom(" w: working tree (unstaged / staged / untracked) ");
         if self.picker.commits_loading || self.picker.commits_error.is_some() {
             let message = self
                 .picker
@@ -1475,6 +1496,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') => self.open_commits(tasks),
+            KeyCode::Char('w') if key.modifiers.is_empty() => self.open_working_tree(newest, tasks),
             KeyCode::Char('q') => {
                 if self.picker.commits.is_empty() {
                     self.open_commits(tasks);
@@ -2393,7 +2415,7 @@ impl App {
             } else if let Some(error) = &self.picker.selection_error {
                 error.clone()
             } else {
-                "↑↓ move   Space/x mark   Enter review   Shift+↑↓ range   / filter   Esc cancel   q close"
+                "w working tree   ↑↓ move   Space/x mark   Enter review   Shift+↑↓ range   / filter   Esc cancel   q close"
                     .into()
             }
         } else if self.mode == Mode::Filter {
@@ -2408,7 +2430,7 @@ impl App {
                 self.notices.len()
             )
         } else {
-            "c: commits  b: sidebar  g: Git diff / Unpushed  Enter: toggle folder  drag scrollbars  Tab focus  / filter  ? help  q commits".into()
+            "w: working tree  c: commits  b: sidebar  g: Git diff / Unpushed  Enter: toggle folder  Tab focus  / filter  ? help  q commits".into()
         };
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
@@ -2932,6 +2954,7 @@ impl App {
                  1 / 2       Changes review / Files browser\n\
                  b           Show / hide the sidebar\n\
                  c           Pick commits (Space/x marks; Shift+Up/Down range; Enter review)\n\
+                 w           Working tree: unstaged, staged, and untracked changes\n\
                  g           Return to Git diff / switch to Unpushed commits in Changes\n\
                  Tab         navigation / diff or source focus\n\
                  Mouse       click folders to expand/collapse, tabs/items/content, drag scrollbars, wheel scroll, drag select\n\
@@ -4111,6 +4134,72 @@ mod tests {
         );
         assert_eq!(app.changes_mode, ChangesMode::Git);
         assert!(matches!(queued.try_recv(), Ok(Task::Scan(_))));
+    }
+
+    #[test]
+    fn working_tree_shortcut_leaves_commit_review_and_discards_stale_source() {
+        for mode in [super::Mode::Normal, super::Mode::Commits] {
+            let mut app = range_picker();
+            app.mode = mode;
+            app.tab = Tab::Files;
+            app.changes_mode = ChangesMode::Commit(app.picker.commits[0].clone());
+            app.files.push(file("committed.rs"));
+            app.cache_source(0, super::plain_source("committed content"));
+            app.picker.commits_error = Some("History unavailable".into());
+            app.picker.marked_commits.insert(1);
+            let stale_generation = app.render_generation;
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+            assert_eq!(app.mode, super::Mode::Normal);
+            assert_eq!(app.tab, Tab::Changes);
+            assert_eq!(app.changes_mode, ChangesMode::Git);
+            assert!(matches!(queued.try_recv(), Ok(Task::Scan(_))));
+            app.request_selected(&tasks);
+            assert!(matches!(
+                queued.try_recv(),
+                Ok(Task::GitScan {
+                    comparison: GitComparison::WorkingTree,
+                    ..
+                })
+            ));
+            app.apply_result(WorkResult::SourcePreview {
+                generation: stale_generation,
+                index: 0,
+                lines: super::plain_source("stale committed content"),
+            });
+            assert!(app.files.is_empty());
+            assert!(app.source_cache.get(&0).is_none());
+            assert!(app.picker.marked_commits.contains(&1));
+        }
+    }
+
+    #[test]
+    fn working_tree_shortcut_preserves_filters_and_recovers_from_busy_worker() {
+        let mut app = range_picker();
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        let (tasks, queued) = std::sync::mpsc::sync_channel(1);
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.picker.commit_filtering = true;
+        app.handle_key(key, &newest, &tasks);
+        assert_eq!(app.picker.commit_filter, "w");
+        assert!(queued.try_recv().is_err());
+        app.picker.commit_filtering = false;
+        app.changes_mode = ChangesMode::Commit(app.picker.commits[0].clone());
+        let previous = app.changes_mode.clone();
+        tasks.send(Task::Scan(1)).unwrap();
+        app.handle_key(key, &newest, &tasks);
+        assert_eq!(app.changes_mode, previous);
+        assert_eq!(app.mode, super::Mode::Commits);
+        assert!(app.picker.selection_error.is_some());
+        queued.try_recv().unwrap();
+        app.handle_key(key, &newest, &tasks);
+        assert_eq!(app.changes_mode, ChangesMode::Git);
+        assert!(app.picker.selection_error.is_none());
     }
 
     fn range_picker() -> App {
