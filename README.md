@@ -242,7 +242,9 @@ Mouse clicks select tabs, folders, and files. Drag the sidebar or diff scrollbar
 
 Press `2` for the Files browser: use the folder tree to explore full source files,
 Enter to expand/collapse folders, and `/` to filter filenames or paths. To browse
-your current checkout while reviewing a commit, press `w`, then `2`.
+your current checkout while reviewing a commit, press `w`, then `2`. Folders start
+collapsed in this view; Enter or a click opens one. Background refreshes preserve
+the folders you open, and opening a search result expands only its folder.
 
 Press `s` to search file contents across the entire displayed tree, independently
 of the filename filter. Type a literal, case-sensitive search term and press Enter.

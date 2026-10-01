@@ -803,6 +803,7 @@ struct App {
     selection: Option<EditorSelection>,
     scrollbar_drag: Option<ScrollbarDrag>,
     collapsed_groups: BTreeSet<(Tab, PathBuf)>,
+    collapse_files_generation: Option<u64>,
     cursor_blink_started: Instant,
     viewport: Rect,
 }
@@ -869,6 +870,7 @@ impl App {
             selection: None,
             scrollbar_drag: None,
             collapsed_groups: BTreeSet::new(),
+            collapse_files_generation: None,
             cursor_blink_started: Instant::now(),
             viewport: Rect::default(),
         }
@@ -963,6 +965,22 @@ impl App {
             self.invalidate_search();
             self.files = files;
             self.file_search_index = FileSearchIndex::from_files(&self.files);
+            if self.collapse_files_generation == Some(result.generation) {
+                self.collapsed_groups
+                    .extend(self.files.iter().filter_map(|file| {
+                        file.relative
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                            .map(|parent| (Tab::Files, parent.to_path_buf()))
+                    }));
+                self.files_state.navigation_group = self.files.first().and_then(|file| {
+                    file.relative
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .map(|parent| (parent.to_path_buf(), 0))
+                });
+                self.collapse_files_generation = None;
+            }
             self.source_cache.clear();
             self.source_notices.clear();
             self.source_width_cache.clear();
@@ -1077,6 +1095,9 @@ impl App {
         if tasks.try_send(task).is_ok() {
             self.invalidate_search();
             self.generation = generation;
+            if self.collapse_files_generation.is_some() {
+                self.collapse_files_generation = Some(generation);
+            }
             newest.store(generation, Ordering::Release);
             self.loading = true;
             self.render_generation = self.render_generation.saturating_add(1);
@@ -1304,7 +1325,10 @@ impl App {
                     self.tab = Tab::Files;
                     self.files_state = TabState::default();
                     self.files_state.selected = index;
-                    self.collapsed_groups.retain(|(tab, _)| *tab != Tab::Files);
+                    if let Some(parent) = hit.path.parent() {
+                        self.collapsed_groups
+                            .remove(&(Tab::Files, parent.to_path_buf()));
+                    }
                     self.mode = Mode::Normal;
                     self.focus = Focus::Content;
                     self.selection = None;
@@ -1346,6 +1370,7 @@ impl App {
         let previous = self.changes_mode.clone();
         self.changes_mode = ChangesMode::Git;
         if self.reset_source(newest, tasks) {
+            self.collapse_files_generation = Some(self.generation);
             self.tab = Tab::Changes;
             self.focus = Focus::Navigation;
             self.mode = Mode::Normal;
@@ -1525,6 +1550,7 @@ impl App {
         self.changes_state = TabState::default();
         self.files_state = TabState::default();
         self.collapsed_groups.clear();
+        self.collapse_files_generation = None;
         self.selection = None;
         self.cursor = None;
         self.scrollbar_drag = None;
