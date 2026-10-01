@@ -224,6 +224,7 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `b` | Hide or show the sidebar. |
 | `g` | Toggle Git diff and Unpushed commits modes; leave commit review. |
 | `c` | Pick a commit from the history of HEAD. |
+| `s` | Search file contents across the displayed tree; return to the previous search results. |
 | `w` | Open working-tree changes (unstaged, staged, and untracked), including from the commit picker. |
 | `Tab` | Move focus between the sidebar and diff/content pane. |
 | Arrow keys, `h`/`j`/`k`/`l` | Navigate the focused area. |
@@ -236,6 +237,26 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `Esc` | Leave filter input or cancel the commit picker. |
 
 Mouse clicks select tabs, folders, and files. Drag the sidebar or diff scrollbar to move quickly through long content. Scrolling over a pane keeps the pointer's pane active.
+
+### Browse and search code
+
+Press `2` for the Files browser: use the folder tree to explore full source files,
+Enter to expand/collapse folders, and `/` to filter filenames or paths. To browse
+your current checkout while reviewing a commit, press `w`, then `2`.
+
+Press `s` to search file contents across the entire displayed tree, independently
+of the filename filter. Type a literal, case-sensitive search term and press Enter.
+Results show `path:line` and a text preview. Use Up/Down and Enter to open the full
+file at that line, with surrounding code. Press `s` again to return to the results,
+`/` to edit the query, or Esc to cancel/back out. Ctrl+U clears the query while editing.
+
+Search uses working files in local mode and Git blobs in commit/range review.
+It follows the Files browser's ignore and project-scope rules. Binary, unreadable,
+invalid UTF-8, and files over 2 MiB are skipped. Each search is bounded to 1,000
+matching lines and 64 MiB of text; the results header identifies partial results
+and counts skipped files. Searching runs in the background and can be cancelled.
+Refreshing or changing revisions invalidates old results; rerun the search to
+use the updated file tree. No files, index entries, or commits are modified.
 
 ## 🧭 Diff semantics
 

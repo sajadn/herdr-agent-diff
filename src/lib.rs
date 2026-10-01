@@ -5,6 +5,7 @@ pub mod git;
 pub mod herdr;
 pub mod model;
 mod project;
+pub mod search;
 pub mod snapshot;
 pub mod state;
 

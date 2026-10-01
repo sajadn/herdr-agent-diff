@@ -156,6 +156,7 @@ enum Mode {
     Help,
     Filter,
     Commits,
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,6 +266,13 @@ type DiffView<'a> = (
 );
 
 enum Task {
+    Search {
+        request: u64,
+        files: Vec<CurrentFile>,
+        revision: Option<String>,
+        query: String,
+        newest: Arc<AtomicU64>,
+    },
     CheckTarget(String),
     Scan(u64),
     RevisionScan {
@@ -299,6 +307,10 @@ struct ScanResult {
 }
 
 enum WorkResult {
+    Search {
+        request: u64,
+        result: std::result::Result<crate::search::SearchResults, String>,
+    },
     TargetExists(Result<bool>),
     Commits {
         request: u64,
@@ -745,10 +757,23 @@ struct CommitPicker {
     commits_error: Option<String>,
 }
 
+#[derive(Default)]
+struct CodeSearch {
+    query: String,
+    editing: bool,
+    loading: bool,
+    selected: usize,
+    newest: Arc<AtomicU64>,
+    results: crate::search::SearchResults,
+    error: Option<String>,
+    jump: Option<(usize, usize)>,
+}
+
 struct App {
     tab: Tab,
     changes_mode: ChangesMode,
     picker: CommitPicker,
+    search: CodeSearch,
     sidebar_visible: bool,
     focus: Focus,
     changes_state: TabState,
@@ -814,6 +839,7 @@ impl App {
             tab: Tab::Changes,
             changes_mode: ChangesMode::Git,
             picker: CommitPicker::default(),
+            search: CodeSearch::default(),
             sidebar_visible: true,
             focus: Focus::Navigation,
             changes_state: TabState::default(),
@@ -851,6 +877,15 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn apply_result(&mut self, result: WorkResult) {
         match result {
+            WorkResult::Search { request, result }
+                if request == self.search.newest.load(Ordering::Acquire) =>
+            {
+                self.search.loading = false;
+                match result {
+                    Ok(results) => self.search.results = results,
+                    Err(error) => self.search.error = Some(error),
+                }
+            }
             WorkResult::Commits { request, result } if request == self.picker.commit_request => {
                 self.picker.commits_loading = false;
                 self.picker.selection_anchor = None;
@@ -925,6 +960,7 @@ impl App {
             self.requested.clear();
         }
         if error.is_none() {
+            self.invalidate_search();
             self.files = files;
             self.file_search_index = FileSearchIndex::from_files(&self.files);
             self.source_cache.clear();
@@ -981,6 +1017,7 @@ impl App {
         self.source_cache.insert(index, lines, bytes);
         self.source_width_cache
             .insert(index, width, std::mem::size_of::<usize>());
+        self.apply_search_jump();
     }
 
     fn apply_git_scan(
@@ -1038,6 +1075,7 @@ impl App {
                 revision: revision.to_owned(),
             });
         if tasks.try_send(task).is_ok() {
+            self.invalidate_search();
             self.generation = generation;
             newest.store(generation, Ordering::Release);
             self.loading = true;
@@ -1057,7 +1095,7 @@ impl App {
     }
 
     fn request_selected(&mut self, tasks: &mpsc::SyncSender<Task>) {
-        if self.mode == Mode::Commits {
+        if matches!(self.mode, Mode::Commits | Mode::Search) {
             return;
         }
         if self.tab == Tab::Changes && self.git_state != GitState::Loaded {
@@ -1174,6 +1212,136 @@ impl App {
         }
     }
 
+    fn invalidate_search(&mut self) {
+        self.search.newest.fetch_add(1, Ordering::AcqRel);
+        self.search.loading = false;
+        self.search.results = crate::search::SearchResults::default();
+        self.search.selected = 0;
+        self.search.jump = None;
+        if !self.search.query.is_empty() {
+            self.search.error = Some("Files refreshed; press / and Enter to search again.".into());
+        }
+    }
+
+    fn open_search(&mut self) {
+        self.mode = Mode::Search;
+        self.search.editing = self.search.results.hits.is_empty() && !self.search.loading;
+    }
+
+    fn submit_search(&mut self, tasks: &mpsc::SyncSender<Task>) {
+        if self.loading {
+            self.search.error = Some("Files are loading; press Enter to retry.".into());
+            return;
+        }
+        self.search.newest.fetch_add(1, Ordering::AcqRel);
+        self.search.results = crate::search::SearchResults::default();
+        self.search.selected = 0;
+        self.search.error = None;
+        self.search.loading = false;
+        if self.search.query.is_empty() {
+            return;
+        }
+        let task = Task::Search {
+            request: self.search.newest.load(Ordering::Acquire),
+            files: self.files.clone(),
+            revision: self.revision().map(str::to_owned),
+            query: self.search.query.clone(),
+            newest: Arc::clone(&self.search.newest),
+        };
+        if tasks.try_send(task).is_ok() {
+            self.search.loading = true;
+            self.search.editing = false;
+        } else {
+            self.search.error = Some("Worker busy; press Enter to retry.".into());
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent, tasks: &mpsc::SyncSender<Task>) {
+        if key.code == KeyCode::Esc || (!self.search.editing && key.code == KeyCode::Char('q')) {
+            self.search.newest.fetch_add(1, Ordering::AcqRel);
+            self.search.loading = false;
+            self.mode = Mode::Normal;
+            return;
+        }
+        if self.search.editing {
+            match key.code {
+                KeyCode::Enter => self.submit_search(tasks),
+                KeyCode::Backspace => {
+                    self.search.query.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.search.query.clear();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.search.query.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('/') => self.search.editing = true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.search.selected = self.search.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.search.selected = self.search.selected.saturating_add(1);
+            }
+            KeyCode::PageUp => self.search.selected = self.search.selected.saturating_sub(10),
+            KeyCode::PageDown => self.search.selected = self.search.selected.saturating_add(10),
+            KeyCode::Home => self.search.selected = 0,
+            KeyCode::End => self.search.selected = self.search.results.hits.len().saturating_sub(1),
+            KeyCode::Enter if !self.search.loading => {
+                if let Some(hit) = self.search.results.hits.get(self.search.selected)
+                    && let Some(index) =
+                        self.files.iter().position(|file| file.relative == hit.path)
+                {
+                    self.search.jump = Some((index, hit.line));
+                    self.tab = Tab::Files;
+                    self.files_state = TabState::default();
+                    self.files_state.selected = index;
+                    self.collapsed_groups.retain(|(tab, _)| *tab != Tab::Files);
+                    self.mode = Mode::Normal;
+                    self.focus = Focus::Content;
+                    self.selection = None;
+                    self.cursor = None;
+                    self.request_selected(tasks);
+                    self.apply_search_jump();
+                    self.keep_navigation_selection_visible();
+                }
+            }
+            _ => {}
+        }
+        self.search.selected = self
+            .search
+            .selected
+            .min(self.search.results.hits.len().saturating_sub(1));
+    }
+
+    fn apply_search_jump(&mut self) {
+        let Some((index, line)) = self.search.jump else {
+            return;
+        };
+        if self.tab != Tab::Files || self.actual_selected() != Some(index) {
+            self.search.jump = None;
+            return;
+        }
+        if let Some(lines) = self.source_cache.get(&index) {
+            let line = line.min(lines.len().saturating_sub(1));
+            self.files_state.scroll_y = line.saturating_sub(5);
+            self.cursor = Some(EditorCursor {
+                tab: Tab::Files,
+                line,
+                column: lines.len().max(1).ilog10() as usize + 4,
+            });
+            self.search.jump = None;
+        }
+    }
+
     fn open_working_tree(&mut self, newest: &AtomicU64, tasks: &mpsc::SyncSender<Task>) {
         let previous = self.changes_mode.clone();
         self.changes_mode = ChangesMode::Git;
@@ -1279,6 +1447,7 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('s') if key.modifiers.is_empty() => self.open_search(),
             KeyCode::Char('w') if key.modifiers.is_empty() => self.open_working_tree(newest, tasks),
             KeyCode::Char(' ' | 'x') if !self.picker.commits_loading && !filtered.is_empty() => {
                 if self.picker.selection_anchor.is_some() {
@@ -1457,6 +1626,10 @@ impl App {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return false;
         }
+        if self.mode == Mode::Search {
+            self.handle_search_key(key, tasks);
+            return false;
+        }
         if self.mode == Mode::Commits {
             if key.code == KeyCode::Char('q') && !self.picker.commit_filtering {
                 return true;
@@ -1496,6 +1669,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') => self.open_commits(tasks),
+            KeyCode::Char('s') if key.modifiers.is_empty() => self.open_search(),
             KeyCode::Char('w') if key.modifiers.is_empty() => self.open_working_tree(newest, tasks),
             KeyCode::Char('q') => {
                 if self.picker.commits.is_empty() {
@@ -2064,7 +2238,7 @@ impl App {
         _newest: &AtomicU64,
         tasks: &mpsc::SyncSender<Task>,
     ) {
-        if self.mode == Mode::Commits {
+        if matches!(self.mode, Mode::Commits | Mode::Search) {
             return;
         }
         let layout = self.ui_layout(self.viewport);
@@ -2385,6 +2559,73 @@ impl App {
         })
     }
 
+    fn draw_search(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let [query_area, results_area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+        let scope = self.revision().map_or_else(
+            || "working tree".to_owned(),
+            |revision| format!("commit {}", &revision[..8]),
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}{}",
+                self.search.query,
+                if self.search.editing { "_" } else { "" }
+            ))
+            .block(
+                Block::bordered()
+                    .title(format!(" Search code — {scope} — literal, case-sensitive ")),
+            ),
+            query_area,
+        );
+        let results = &self.search.results;
+        let block = Block::bordered().title(format!(
+            " {} matching lines · {} skipped files{} ",
+            results.hits.len(),
+            results.skipped,
+            if results.limited {
+                " · partial results: limit reached"
+            } else {
+                ""
+            },
+        ));
+        if let Some(error) = &self.search.error {
+            frame.render_widget(Paragraph::new(error.as_str()).block(block), results_area);
+        } else if self.search.loading || results.hits.is_empty() {
+            let message = if self.search.loading {
+                "Searching… Esc cancels."
+            } else if self.search.editing {
+                "Enter a search term, then press Enter."
+            } else {
+                "No matches. Press / to edit the search."
+            };
+            frame.render_widget(Paragraph::new(message).block(block), results_area);
+        } else {
+            let items: Vec<_> = results
+                .hits
+                .iter()
+                .map(|hit| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{}:{}  ", hit.path.display(), hit.line + 1),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::raw(&hit.preview),
+                    ]))
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some(self.search.selected));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(block)
+                    .highlight_style(Style::default().bg(PANEL_SELECTION).bold())
+                    .highlight_symbol("› "),
+                results_area,
+                &mut state,
+            );
+        }
+    }
+
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         self.viewport = area;
@@ -2397,7 +2638,9 @@ impl App {
                 .highlight_style(Style::default().fg(Color::Cyan).bold()),
             layout.tabs,
         );
-        if self.mode == Mode::Commits {
+        if self.mode == Mode::Search {
+            self.draw_search(frame, layout.body);
+        } else if self.mode == Mode::Commits {
             self.draw_commits(frame, layout.body);
         } else if self.mode == Mode::Help {
             Self::draw_help(frame, layout.body);
@@ -2409,7 +2652,13 @@ impl App {
         } else if let Some(content) = layout.content {
             self.draw_content(frame, content);
         }
-        let status = if self.mode == Mode::Commits {
+        let status = if self.mode == Mode::Search {
+            if self.search.editing {
+                "Enter search   Backspace edit   Ctrl+U clear   Esc back".into()
+            } else {
+                "↑↓ choose result   Enter open at line   / edit search   Esc back   s returns to results".into()
+            }
+        } else if self.mode == Mode::Commits {
             if self.picker.commit_filtering {
                 format!("Filter commits: {}_", self.picker.commit_filter)
             } else if let Some(error) = &self.picker.selection_error {
@@ -2430,13 +2679,13 @@ impl App {
                 self.notices.len()
             )
         } else {
-            "w: working tree  c: commits  b: sidebar  g: Git diff / Unpushed  Enter: toggle folder  Tab focus  / filter  ? help  q commits".into()
+            "2: browse files  s: search code  /: filenames  w: working tree  c: commits  b: sidebar  Tab focus  ? help  q commits".into()
         };
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
             layout.status,
         );
-        if self.mode != Mode::Commits {
+        if !matches!(self.mode, Mode::Commits | Mode::Search) {
             self.draw_cursor(frame, layout.content);
         }
     }
@@ -2888,7 +3137,16 @@ impl App {
                 let index = scroll_y.saturating_add(offset);
                 let mut output = vec![Span::styled(
                     format!("{:>width$} │ ", index + 1),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(
+                        if self
+                            .cursor
+                            .is_some_and(|cursor| cursor.tab == Tab::Files && cursor.line == index)
+                        {
+                            Color::Yellow
+                        } else {
+                            Color::DarkGray
+                        },
+                    ),
                 )];
                 let selection = self.selection_range_for_line(index);
                 let mut column = width.saturating_add(3);
@@ -2952,6 +3210,7 @@ impl App {
             Paragraph::new(
                 "Git Changes\n\n\
                  1 / 2       Changes review / Files browser\n\
+                 s           Search file contents; Enter searches / opens a result at its line\n\
                  b           Show / hide the sidebar\n\
                  c           Pick commits (Space/x marks; Shift+Up/Down range; Enter review)\n\
                  w           Working tree: unstaged, staged, and untracked changes\n\
@@ -2991,6 +3250,36 @@ fn spawn_worker(
         let theme = Arc::new(OnceLock::<Theme>::new());
         while let Ok(task) = tasks.recv() {
             match task {
+                Task::Search {
+                    request,
+                    files,
+                    revision,
+                    query,
+                    newest,
+                } => {
+                    let root = root.clone();
+                    let search_results = results.clone();
+                    if let Err(error) = thread::Builder::new().spawn(move || {
+                        if let Some(result) = crate::search::search_files(
+                            &root,
+                            &files,
+                            revision.as_deref(),
+                            &query,
+                            &newest,
+                            request,
+                        ) {
+                            let _ = search_results.send(WorkResult::Search {
+                                request,
+                                result: Ok(result),
+                            });
+                        }
+                    }) {
+                        let _ = results.send(WorkResult::Search {
+                            request,
+                            result: Err(error.to_string()),
+                        });
+                    }
+                }
                 Task::CheckTarget(pane_id) => {
                     let _ = results.send(WorkResult::TargetExists(pane_exists(&herdr, &pane_id)));
                 }
@@ -4134,6 +4423,123 @@ mod tests {
         );
         assert_eq!(app.changes_mode, ChangesMode::Git);
         assert!(matches!(queued.try_recv(), Ok(Task::Scan(_))));
+    }
+
+    #[test]
+    fn code_search_opens_full_file_at_result_after_async_preview() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.files = vec![file("a.rs"), file("nested/b.rs")];
+        app.file_search_index = super::FileSearchIndex::from_files(&app.files);
+        app.files_state.filter = "a.rs".into();
+        app.collapsed_groups.insert((Tab::Files, "nested".into()));
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('s')), &newest, &tasks);
+        for c in "needle".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &newest, &tasks);
+        }
+        app.handle_key(key(KeyCode::Enter), &newest, &tasks);
+        let Task::Search {
+            request,
+            query,
+            files,
+            ..
+        } = queued.try_recv().unwrap()
+        else {
+            panic!("expected code search");
+        };
+        assert_eq!(query, "needle");
+        assert_eq!(
+            files.len(),
+            2,
+            "filename filter must not restrict code search"
+        );
+        app.apply_result(WorkResult::Search {
+            request,
+            result: Ok(crate::search::SearchResults {
+                hits: vec![crate::search::SearchHit {
+                    path: "nested/b.rs".into(),
+                    line: 50,
+                    preview: "needle".into(),
+                }],
+                ..Default::default()
+            }),
+        });
+        assert!(render(&mut app, 120, 20).contains("nested/b.rs:51"));
+        app.handle_key(key(KeyCode::Enter), &newest, &tasks);
+        assert_eq!(app.tab, Tab::Files);
+        assert_eq!(app.actual_selected(), Some(1));
+        assert!(app.files_state.filter.is_empty());
+        assert!(app.collapsed_groups.is_empty());
+        assert!(app.search.jump.is_some(), "wait for source before jumping");
+        let Task::Highlight {
+            generation, index, ..
+        } = queued.try_recv().unwrap()
+        else {
+            panic!("expected source preview");
+        };
+        let mut lines = vec!["surrounding code"; 100];
+        lines[50] = "needle";
+        app.apply_result(WorkResult::SourcePreview {
+            generation,
+            index,
+            lines: super::plain_source(&lines.join("\n")),
+        });
+        assert!(app.search.jump.is_none());
+        assert_eq!(app.cursor.unwrap().line, 50);
+        assert!(render(&mut app, 120, 20).contains("needle"));
+        app.handle_key(key(KeyCode::Char('s')), &newest, &tasks);
+        assert_eq!(app.mode, super::Mode::Search);
+        assert!(!app.search.editing);
+    }
+
+    #[test]
+    fn cancelled_or_refreshed_code_search_discards_late_results() {
+        for refresh in [false, true] {
+            let mut app = App::new("w1:p1".into());
+            app.loading = false;
+            app.open_search();
+            app.search.query = "query".into();
+            let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            app.submit_search(&tasks);
+            let Task::Search {
+                request,
+                newest: cancelled,
+                ..
+            } = queued.try_recv().unwrap()
+            else {
+                panic!("expected search");
+            };
+            if refresh {
+                assert!(app.refresh(&newest, &tasks));
+            } else {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+            }
+            assert_ne!(
+                cancelled.load(std::sync::atomic::Ordering::Acquire),
+                request
+            );
+            app.apply_result(WorkResult::Search {
+                request,
+                result: Ok(crate::search::SearchResults {
+                    hits: vec![crate::search::SearchHit {
+                        path: "stale.rs".into(),
+                        line: 0,
+                        preview: "stale".into(),
+                    }],
+                    ..Default::default()
+                }),
+            });
+            assert!(app.search.results.hits.is_empty());
+            assert!(!app.search.loading);
+        }
     }
 
     #[test]
