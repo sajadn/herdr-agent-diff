@@ -157,6 +157,7 @@ enum Mode {
     Filter,
     Commits,
     Search,
+    FileFind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -769,11 +770,89 @@ struct CodeSearch {
     jump: Option<(usize, usize)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileMatch {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Default)]
+struct FileFind {
+    query: String,
+    editing: bool,
+    matches: Vec<FileMatch>,
+    selected: usize,
+    truncated: bool,
+    error: Option<String>,
+}
+
+impl FileFind {
+    fn collect(&mut self, lines: &[Vec<ColoredSpan>]) {
+        self.matches.clear();
+        self.selected = 0;
+        self.truncated = false;
+        if self.query.is_empty() {
+            return;
+        }
+        let gutter = decimal_width(lines.len()) + 3;
+        let query_width: usize = self.query.chars().map(|c| c.width().unwrap_or(0)).sum();
+        for (line, spans) in lines.iter().enumerate() {
+            let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+            let mut previous = 0;
+            let mut column = gutter;
+            for (offset, matched) in text.match_indices(&self.query) {
+                if self.matches.len() == 10_000 {
+                    self.truncated = true;
+                    return;
+                }
+                column += text[previous..offset]
+                    .chars()
+                    .map(|c| c.width().unwrap_or(0))
+                    .sum::<usize>();
+                self.matches.push(FileMatch {
+                    line,
+                    start: column,
+                    end: column + query_width,
+                });
+                column += query_width;
+                previous = offset + matched.len();
+            }
+        }
+    }
+
+    fn status(&self) -> String {
+        if self.editing {
+            return format!(
+                "Find in file: {}_  Enter search (literal, case-sensitive)  Ctrl+U clear  Esc back",
+                self.query
+            );
+        }
+        let count = self.error.clone().unwrap_or_else(|| {
+            if self.matches.is_empty() {
+                "No matches".into()
+            } else {
+                format!(
+                    "{}/{}{}",
+                    self.selected + 1,
+                    self.matches.len(),
+                    if self.truncated { "+ (limited)" } else { "" }
+                )
+            }
+        });
+        format!(
+            "Find: {}  {count}  Enter/n next  Shift+Enter/N previous  Ctrl+F edit  Esc back",
+            self.query
+        )
+    }
+}
+
 struct App {
     tab: Tab,
     changes_mode: ChangesMode,
     picker: CommitPicker,
     search: CodeSearch,
+    file_find: FileFind,
     sidebar_visible: bool,
     focus: Focus,
     changes_state: TabState,
@@ -841,6 +920,7 @@ impl App {
             changes_mode: ChangesMode::Git,
             picker: CommitPicker::default(),
             search: CodeSearch::default(),
+            file_find: FileFind::default(),
             sidebar_visible: true,
             focus: Focus::Navigation,
             changes_state: TabState::default(),
@@ -1243,6 +1323,10 @@ impl App {
     }
 
     fn invalidate_search(&mut self) {
+        self.file_find = FileFind::default();
+        if self.mode == Mode::FileFind {
+            self.mode = Mode::Normal;
+        }
         self.search.newest.fetch_add(1, Ordering::AcqRel);
         self.search.loading = false;
         self.search.results = crate::search::SearchResults::default();
@@ -1372,6 +1456,113 @@ impl App {
                 column: lines.len().max(1).ilog10() as usize + 4,
             });
             self.search.jump = None;
+        }
+    }
+
+    fn open_file_find(&mut self) {
+        if self.tab != Tab::Files || self.actual_selected().is_none() {
+            return;
+        }
+        self.mode = Mode::FileFind;
+        self.focus = Focus::Content;
+        self.selection = None;
+        self.file_find.editing = true;
+        self.file_find.matches.clear();
+        self.file_find.error = None;
+    }
+
+    fn submit_file_find(&mut self, backwards: bool) {
+        self.file_find.editing = false;
+        self.file_find.matches.clear();
+        self.file_find.error = None;
+        let Some(index) = self.actual_selected() else {
+            return;
+        };
+        if self.loading {
+            self.file_find.error = Some("File loading; Ctrl+F then Enter to retry".into());
+        } else if let Some(notice) = self.source_notices.get(&index) {
+            self.file_find.error = Some(notice.clone());
+        } else if let Some(lines) = self.source_cache.get(&index) {
+            self.file_find.collect(lines);
+            if backwards {
+                self.file_find.selected = self.file_find.matches.len().saturating_sub(1);
+            }
+            self.jump_file_match();
+        } else {
+            self.file_find.error = Some("File loading; Ctrl+F then Enter to retry".into());
+        }
+    }
+
+    fn jump_file_match(&mut self) {
+        let Some(hit) = self.file_find.matches.get(self.file_find.selected).copied() else {
+            return;
+        };
+        self.files_state.scroll_y = hit.line.saturating_sub(5);
+        let width = self
+            .ui_layout(self.viewport)
+            .content
+            .map_or(0, |area| usize::from(area.width.saturating_sub(3)));
+        let scroll = self.files_state.scroll_x;
+        if hit.start < scroll || hit.end >= scroll.saturating_add(width) {
+            self.files_state.scroll_x = hit.start.saturating_sub(5);
+        }
+        self.cursor = Some(EditorCursor {
+            tab: Tab::Files,
+            line: hit.line,
+            column: hit.start,
+        });
+    }
+
+    fn handle_file_find_key(&mut self, key: KeyEvent) {
+        // Scrolling the sidebar with the mouse must not make search arrows
+        // select another file while keeping the old match positions.
+        self.focus = Focus::Content;
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Normal;
+            return;
+        }
+        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_file_find();
+            return;
+        }
+        if self.file_find.editing {
+            match key.code {
+                KeyCode::Enter => {
+                    self.submit_file_find(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
+                KeyCode::Backspace => {
+                    self.file_find.query.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.file_find.query.clear();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.file_find.query.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::F(3) | KeyCode::Char('n' | 'N') => {
+                let count = self.file_find.matches.len();
+                if count > 0 {
+                    let backwards = key.code == KeyCode::Char('N')
+                        || key.modifiers.contains(KeyModifiers::SHIFT);
+                    self.file_find.selected =
+                        (self.file_find.selected + if backwards { count - 1 } else { 1 }) % count;
+                    self.jump_file_match();
+                }
+            }
+            KeyCode::Up => self.move_vertical(-1),
+            KeyCode::Down => self.move_vertical(1),
+            KeyCode::PageUp => self.move_vertical(-20),
+            KeyCode::PageDown => self.move_vertical(20),
+            _ => {}
         }
     }
 
@@ -1661,6 +1852,10 @@ impl App {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return false;
         }
+        if self.mode == Mode::FileFind {
+            self.handle_file_find_key(key);
+            return false;
+        }
         if self.mode == Mode::Search {
             self.handle_search_key(key, tasks);
             return false;
@@ -1693,6 +1888,9 @@ impl App {
             return false;
         }
         match key.code {
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_file_find();
+            }
             KeyCode::Char(character)
                 if character.eq_ignore_ascii_case(&'c')
                     && key.modifiers.intersects(
@@ -2278,7 +2476,7 @@ impl App {
             }
             return;
         }
-        if self.mode == Mode::Filter && left_click {
+        if matches!(self.mode, Mode::Filter | Mode::FileFind) && left_click {
             self.mode = Mode::Normal;
         }
 
@@ -2674,7 +2872,9 @@ impl App {
         } else if let Some(content) = layout.content {
             self.draw_content(frame, content);
         }
-        let status = if self.mode == Mode::Search {
+        let status = if self.mode == Mode::FileFind {
+            self.file_find.status()
+        } else if self.mode == Mode::Search {
             if self.search.editing {
                 "Enter search   Backspace edit   Ctrl+U clear   Esc back".into()
             } else {
@@ -2701,7 +2901,7 @@ impl App {
                 self.notices.len()
             )
         } else {
-            "2: browse files  s: search code  /: filenames  w: working tree  c: commits  b: sidebar  Tab focus  ? help  q commits".into()
+            "2: files  Ctrl+F: find in file  s: search code  /: filenames  w: working tree  c: commits  b: sidebar  Tab focus  ? help  q commits".into()
         };
         frame.render_widget(
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
@@ -3170,7 +3370,15 @@ impl App {
                         },
                     ),
                 )];
-                let selection = self.selection_range_for_line(index);
+                let selection = if self.mode == Mode::FileFind {
+                    self.file_find
+                        .matches
+                        .get(self.file_find.selected)
+                        .filter(|hit| hit.line == index)
+                        .map(|hit| (hit.start, hit.end))
+                } else {
+                    self.selection_range_for_line(index)
+                };
                 let mut column = width.saturating_add(3);
                 for span in spans {
                     let (rendered, next_column) = render_source_span(span, column, selection);
@@ -3233,6 +3441,7 @@ impl App {
                 "Git Changes\n\n\
                  1 / 2       Changes review / Files browser\n\
                  s           Search file contents; Enter searches / opens a result at its line\n\
+                 Ctrl+F      Find in open file; Enter/n next, Shift+Enter/N previous, Esc back\n\
                  b           Show / hide the sidebar\n\
                  c           Pick commits (Space/x marks; Shift+Up/Down range; Enter review)\n\
                  w           Working tree: unstaged, staged, and untracked changes\n\
@@ -4069,7 +4278,9 @@ fn source_content_dimensions(lines: &[Vec<ColoredSpan>]) -> (usize, usize) {
     let line_number_width = decimal_width(lines.len());
     let content_width = lines
         .iter()
-        .map(|spans| line_number_width.saturating_add(3 + source_text_width(spans)))
+        // Leave one cell after the text so the vertical scrollbar cannot cover
+        // the last character when horizontally scrolled to the end of a line.
+        .map(|spans| line_number_width.saturating_add(4 + source_text_width(spans)))
         .max()
         .unwrap_or(0);
     (lines.len(), content_width)
@@ -4451,6 +4662,191 @@ mod tests {
         );
         assert_eq!(app.changes_mode, ChangesMode::Git);
         assert!(matches!(queued.try_recv(), Ok(Task::Scan(_))));
+    }
+
+    #[test]
+    fn file_find_matches_literal_text_across_spans_with_unicode_columns_and_limits() {
+        let mut find = super::FileFind {
+            query: "界.".into(),
+            ..Default::default()
+        };
+        let mut lines = super::plain_source("é界. 界.\n界X");
+        lines[0] = vec![
+            super::ColoredSpan {
+                text: "é界".into(),
+                foreground: Color::Red,
+            },
+            super::ColoredSpan {
+                text: ". 界.".into(),
+                foreground: Color::Blue,
+            },
+        ];
+        find.collect(&lines);
+        assert_eq!(
+            find.matches,
+            vec![
+                super::FileMatch {
+                    line: 0,
+                    start: 5,
+                    end: 8
+                },
+                super::FileMatch {
+                    line: 0,
+                    start: 9,
+                    end: 12
+                },
+            ]
+        );
+        find.query = "É".into();
+        find.collect(&lines);
+        assert!(find.matches.is_empty());
+        find.query.clear();
+        find.collect(&lines);
+        assert!(find.matches.is_empty());
+        find.query = "x".into();
+        find.collect(&super::plain_source(&"x".repeat(10_001)));
+        assert_eq!(find.matches.len(), 10_000);
+        assert!(find.truncated);
+        assert!(find.status().contains("limited"));
+    }
+
+    #[test]
+    fn file_find_keys_search_only_open_file_and_wrap_in_both_directions() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("a.rs"), file("b.rs")];
+        app.cache_source(0, super::plain_source("needle needle\nNEEDLE"));
+        app.cache_source(1, super::plain_source("needle"));
+        let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_f, &newest, &tasks);
+        for c in "needle".chars() {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &newest,
+                &tasks,
+            );
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.mode, super::Mode::FileFind);
+        assert_eq!(app.file_find.matches.len(), 2);
+        assert!(render(&mut app, 140, 20).contains("1/2"));
+        for (code, modifiers, selected) in [
+            (KeyCode::Enter, KeyModifiers::NONE, 1),
+            (KeyCode::Char('n'), KeyModifiers::NONE, 0),
+            (KeyCode::Char('N'), KeyModifiers::SHIFT, 1),
+            (KeyCode::Enter, KeyModifiers::SHIFT, 0),
+            (KeyCode::F(3), KeyModifiers::SHIFT, 1),
+            (KeyCode::F(3), KeyModifiers::NONE, 0),
+        ] {
+            app.handle_key(KeyEvent::new(code, modifiers), &newest, &tasks);
+            assert_eq!(app.file_find.selected, selected);
+        }
+        app.focus = Focus::Navigation;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.actual_selected(), Some(0));
+        app.handle_key(ctrl_f, &newest, &tasks);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &newest,
+            &tasks,
+        );
+        assert!(app.file_find.query.is_empty());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert!(render(&mut app, 140, 20).contains("No matches"));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.mode, super::Mode::Normal);
+        assert_eq!(app.tab, Tab::Files);
+    }
+
+    #[test]
+    fn file_find_scrolls_to_and_highlights_match_beyond_viewport() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.sidebar_visible = false;
+        app.files = vec![file("a.rs")];
+        app.cache_source(
+            0,
+            super::plain_source(&format!("{}{}needle", "line\n".repeat(50), " ".repeat(150))),
+        );
+        app.viewport = Rect::new(0, 0, 100, 20);
+        app.open_file_find();
+        app.file_find.query = "needle".into();
+        app.submit_file_find(false);
+        assert_eq!(app.cursor.unwrap().line, 50);
+        assert!(app.files_state.scroll_y > 0);
+        assert!(app.files_state.scroll_x > 0);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let source = app.ui_layout(buffer.area).content.unwrap();
+        let highlighted: String = (source.y + 1..source.bottom() - 1)
+            .flat_map(|y| {
+                (source.x + 1..source.right() - 1).filter_map(move |x| {
+                    let cell = &buffer[(x, y)];
+                    (cell.bg == super::PANEL_SELECTION).then(|| cell.symbol())
+                })
+            })
+            .collect();
+        assert_eq!(highlighted, "needle");
+    }
+
+    #[test]
+    fn file_find_reports_unavailable_sources_and_clears_on_refresh_or_file_change() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.tab = Tab::Files;
+        app.files = vec![file("a.rs"), file("b.rs")];
+        app.open_file_find();
+        app.file_find.query = "needle".into();
+        app.submit_file_find(false);
+        assert!(app.file_find.status().contains("loading"));
+        app.source_notices.insert(0, "Binary file".into(), 11);
+        app.submit_file_find(false);
+        assert!(app.file_find.status().contains("Binary file"));
+        app.source_notices.clear();
+        app.cache_source(0, super::plain_source("needle"));
+        app.submit_file_find(false);
+        assert_eq!(app.file_find.matches.len(), 1);
+        app.viewport = Rect::new(0, 0, 100, 20);
+        let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+        let newest = std::sync::atomic::AtomicU64::new(1);
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 4, 3),
+            &newest,
+            &tasks,
+        );
+        assert_eq!(app.mode, super::Mode::Normal);
+        assert_eq!(app.actual_selected(), Some(1));
+        app.open_file_find();
+        assert!(app.file_find.matches.is_empty());
+        app.invalidate_search();
+        assert_eq!(app.mode, super::Mode::Normal);
+        assert!(app.file_find.query.is_empty());
     }
 
     #[test]

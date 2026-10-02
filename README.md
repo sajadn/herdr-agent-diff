@@ -215,6 +215,8 @@ than including hidden changes. Starting a filter clears the selection.
 
 The Files tab uses the same folder grouping, indentation, collapse behavior, selection gutter, and navigation styling as the Changes tab. Select a file to browse its current contents with line numbers and syntax highlighting. Press `b` to hide or show the sidebar, or `/` to search filenames or relative paths with a case-insensitive substring filter.
 
+Ctrl+F searches only the displayed file, including historical file contents during commit review. The current match is highlighted and scrolled into view. Matches wrap at either end; Ctrl+F edits the query and Ctrl+U clears it. Searches are limited to the first 10,000 occurrences, with a notice when that limit is reached.
+
 ### 🎛️ Controls
 
 | Key | Action |
@@ -225,6 +227,7 @@ The Files tab uses the same folder grouping, indentation, collapse behavior, sel
 | `g` | Toggle Git diff and Unpushed commits modes; leave commit review. |
 | `c` | Pick a commit from the history of HEAD. |
 | `s` | Search file contents across the displayed tree; return to the previous search results. |
+| `Ctrl+F` | Find literal, case-sensitive text in the open file (Files tab). Enter searches; Enter/`n`/F3 next, Shift+Enter/`N`/Shift+F3 previous, Esc returns to browsing. |
 | `w` | Open working-tree changes (unstaged, staged, and untracked), including from the commit picker. |
 | `Tab` | Move focus between the sidebar and diff/content pane. |
 | Arrow keys, `h`/`j`/`k`/`l` | Navigate the focused area. |
