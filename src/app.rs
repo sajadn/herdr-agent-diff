@@ -183,7 +183,7 @@ enum NavigationRow {
 #[derive(Clone, Debug, Default)]
 struct TabState {
     selected: usize,
-    navigation_group: Option<(PathBuf, usize)>,
+    navigation_group: Option<PathBuf>,
     list_scroll_y: usize,
     scroll_y: usize,
     scroll_x: usize,
@@ -964,6 +964,10 @@ impl App {
         if error.is_none() {
             self.invalidate_search();
             self.files = files;
+            // Group once per scan, before assigning search/cache indices. Sorting
+            // whole paths alone interleaves parent files with nested folders.
+            self.files
+                .sort_by(|left, right| compare_folder_paths(&left.relative, &right.relative));
             self.file_search_index = FileSearchIndex::from_files(&self.files);
             if self.collapse_files_generation == Some(result.generation) {
                 self.collapsed_groups
@@ -977,7 +981,7 @@ impl App {
                     file.relative
                         .parent()
                         .filter(|parent| !parent.as_os_str().is_empty())
-                        .map(|parent| (parent.to_path_buf(), 0))
+                        .map(Path::to_path_buf)
                 });
                 self.collapse_files_generation = None;
             }
@@ -1041,12 +1045,17 @@ impl App {
     fn apply_git_scan(
         &mut self,
         comparison: &GitComparison,
-        changes: Vec<GitChange>,
+        mut changes: Vec<GitChange>,
         unpushed_commits: Option<usize>,
         error: Option<String>,
     ) {
         self.git_state = GitState::Loaded;
         self.requested.clear();
+        changes.sort_by(|left, right| {
+            git_state_rank(left.state)
+                .cmp(&git_state_rank(right.state))
+                .then_with(|| compare_folder_paths(&left.path, &right.path))
+        });
         self.git_scan_cache[git_comparison_index(comparison)] = Some(GitScanCache {
             changes: changes.clone(),
             unpushed_commits,
@@ -1795,19 +1804,15 @@ impl App {
         }
         let current = self.selected_navigation_row(&rows).unwrap_or(0);
         let next = current.saturating_add_signed(delta).min(rows.len() - 1);
-        self.select_navigation_row(&rows[next], next);
+        self.select_navigation_row(&rows[next]);
         self.keep_navigation_selection_visible();
     }
 
     fn selected_navigation_row(&self, rows: &[NavigationRow]) -> Option<usize> {
-        if let Some((group, occurrence)) = &self.active_state().navigation_group
-            && let Some((index, _)) = rows
+        if let Some(group) = &self.active_state().navigation_group
+            && let Some(index) = rows
                 .iter()
-                .enumerate()
-                .filter(
-                    |(_, row)| matches!(row, NavigationRow::Group { path, .. } if path == group),
-                )
-                .nth(*occurrence)
+                .position(|row| matches!(row, NavigationRow::Group { path, .. } if path == group))
         {
             return Some(index);
         }
@@ -1816,16 +1821,12 @@ impl App {
             .position(|row| matches!(row, NavigationRow::File { index, .. } if *index == selected))
     }
 
-    fn select_navigation_row(&mut self, row: &NavigationRow, position: usize) {
+    fn select_navigation_row(&mut self, row: &NavigationRow) {
         self.cursor = None;
         self.selection = None;
         match row {
             NavigationRow::Group { path, .. } => {
-                // A full-path folder header may appear again after nested folders.
-                let occurrence = self.navigation_rows().iter().take(position).filter(|row| {
-                    matches!(row, NavigationRow::Group { path: candidate, .. } if candidate == path)
-                }).count();
-                self.active_state_mut().navigation_group = Some((path.clone(), occurrence));
+                self.active_state_mut().navigation_group = Some(path.clone());
             }
             NavigationRow::File { index, .. } => {
                 if let Some(selected) = self
@@ -2304,12 +2305,7 @@ impl App {
                 && let Some(row) = self.navigation_row_at(area, mouse.column, mouse.row)
             {
                 self.focus = Focus::Navigation;
-                let position = self
-                    .navigation_scroll_offset(area)
-                    .saturating_add(usize::from(
-                        mouse.row.saturating_sub(bordered_inner(area).y),
-                    ));
-                self.select_navigation_row(&row, position);
+                self.select_navigation_row(&row);
                 match row {
                     NavigationRow::File { .. } => {
                         self.request_selected(tasks);
@@ -3647,6 +3643,12 @@ fn syntax_for_file<'a>(
             .flatten(),
     };
     syntax.unwrap_or_else(|| syntaxes.find_syntax_plain_text())
+}
+
+fn compare_folder_paths(left: &Path, right: &Path) -> std::cmp::Ordering {
+    left.parent()
+        .cmp(&right.parent())
+        .then_with(|| left.cmp(right))
 }
 
 fn filtered_git_indices(changes: &[GitChange], filter: &str) -> Vec<usize> {
@@ -5416,32 +5418,130 @@ mod tests {
     }
 
     #[test]
-    fn repeated_folder_headers_keep_the_selected_occurrence() {
-        let mut app = App::new("w1:p1".into());
-        app.loading = false;
-        app.tab = Tab::Files;
-        app.files = vec![file("src/a.rs"), file("src/nested/b.rs"), file("src/z.rs")];
-        let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
-        let newest = std::sync::atomic::AtomicU64::new(1);
-        for _ in 0..3 {
+    fn nested_paths_keep_each_folder_together_and_keyboard_selection_stable() {
+        for tab in [Tab::Files, Tab::Changes] {
+            let mut app = App::new("w1:p1".into());
+            let paths = ["src/a.rs", "src/nested/b.rs", "src/z.rs"];
+            app.apply_scan_result(super::ScanResult {
+                generation: app.generation,
+                files: paths.iter().map(|path| file(path)).collect(),
+                notices: Vec::new(),
+                error: None,
+            });
+            app.apply_git_scan(
+                &GitComparison::WorkingTree,
+                paths
+                    .iter()
+                    .map(|path| git_change(path, ChangeKind::Modified))
+                    .collect(),
+                None,
+                None,
+            );
+            app.tab = tab;
+            let (tasks, _queued) = std::sync::mpsc::sync_channel(8);
+            let newest = std::sync::atomic::AtomicU64::new(1);
+            let rows = app.navigation_rows();
+            let folders: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    super::NavigationRow::Group {
+                        label,
+                        kind: super::NavigationGroupKind::Folder,
+                        ..
+                    } => Some(label.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(folders, ["src/", "src/nested/"]);
+            let names: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    super::NavigationRow::File { label, .. } => Some(label.as_str()),
+                    super::NavigationRow::Group { .. } => None,
+                })
+                .collect();
+            assert_eq!(names, ["a.rs", "z.rs", "b.rs"]);
+
             app.move_vertical(1);
+            let selected = app.actual_selected().unwrap();
+            let path = match tab {
+                Tab::Files => &app.files[selected].relative,
+                Tab::Changes => &app.git_changes[selected].path,
+            };
+            assert_eq!(path, std::path::Path::new("src/z.rs"));
+            app.move_vertical(1);
+            let position = app.selected_navigation_row(&app.navigation_rows()).unwrap();
+            assert!(
+                matches!(&app.navigation_rows()[position], super::NavigationRow::Group { label, .. } if label == "src/nested/")
+            );
+            for expected_len in [rows.len() - 1, rows.len()] {
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &newest,
+                    &tasks,
+                );
+                assert_eq!(app.navigation_rows().len(), expected_len);
+                assert_eq!(
+                    app.selected_navigation_row(&app.navigation_rows()),
+                    Some(position)
+                );
+            }
+            app.move_vertical(1);
+            let selected = app.actual_selected().unwrap();
+            let path = match tab {
+                Tab::Files => &app.files[selected].relative,
+                Tab::Changes => &app.git_changes[selected].path,
+            };
+            assert_eq!(path, std::path::Path::new("src/nested/b.rs"));
+            app.active_state_mut().filter = "src/".into();
+            assert_eq!(app.navigation_rows().len(), rows.len());
         }
-        assert_eq!(app.selected_navigation_row(&app.navigation_rows()), Some(4));
-        assert_eq!(app.files_state.navigation_group, Some(("src".into(), 1)));
-        app.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &newest,
-            &tasks,
+    }
+
+    #[test]
+    fn folders_are_unique_within_each_git_status_and_root_files_come_first() {
+        let mut app = App::new("w1:p1".into());
+        let paths = ["a.rs", "src/a.rs", "src/nested/b.rs", "src/z.rs", "z.rs"];
+        let changes = [GitFileState::Unstaged, GitFileState::Staged]
+            .into_iter()
+            .flat_map(|state| {
+                paths.iter().map(move |path| {
+                    let mut change = git_change(path, ChangeKind::Modified);
+                    change.state = state;
+                    change
+                })
+            })
+            .collect();
+        app.apply_git_scan(&GitComparison::WorkingTree, changes, None, None);
+        let rows = app.navigation_rows();
+        let groups: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                super::NavigationRow::Group { path, .. } => Some(path),
+                super::NavigationRow::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(groups.len(), 6);
+        assert_eq!(
+            groups
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            groups.len()
         );
-        assert_eq!(app.selected_navigation_row(&app.navigation_rows()), Some(3));
-        app.handle_key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &newest,
-            &tasks,
+        assert!(
+            matches!(&rows[1], super::NavigationRow::File { label, depth: 1, .. } if label == "a.rs")
         );
-        assert_eq!(app.selected_navigation_row(&app.navigation_rows()), Some(4));
-        app.move_vertical(-1);
-        assert_eq!(app.actual_selected(), Some(1));
+        assert!(
+            matches!(&rows[2], super::NavigationRow::File { label, depth: 1, .. } if label == "z.rs")
+        );
+        app.toggle_group(super::git_folder_group_path(
+            GitFileState::Staged,
+            std::path::Path::new("src"),
+        ));
+        assert_eq!(app.navigation_rows().len(), rows.len() - 2);
+        app.changes_state.filter = "src/".into();
+        assert_eq!(app.navigation_rows().len(), rows.len() - 6);
     }
 
     #[test]
