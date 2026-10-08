@@ -226,7 +226,7 @@ Ctrl+F searches only the displayed file, including historical file contents duri
 | `b` | Hide or show the sidebar. |
 | `g` | Toggle Git diff and Unpushed commits modes; leave commit review. |
 | `c` | Pick a commit from the history of HEAD. |
-| `s` | Search file contents across the displayed tree; return to the previous search results. |
+| `s` | Search contents: changed files from Changes, all files from Files; return to previous results. Tab in search switches scope. |
 | `Ctrl+F` | Find literal, case-sensitive text in the open file (Files tab). Enter searches; Enter/`n`/F3 next, Shift+Enter/`N`/Shift+F3 previous, Esc returns to browsing. |
 | `w` | Open working-tree changes (unstaged, staged, and untracked), including from the commit picker. |
 | `Tab` | Move focus between the sidebar and diff/content pane. |
@@ -249,8 +249,17 @@ your current checkout while reviewing a commit, press `w`, then `2`. Folders sta
 collapsed in this view; Enter or a click opens one. Background refreshes preserve
 the folders you open, and opening a search result expands only its folder.
 
-Press `s` to search file contents across the entire displayed tree, independently
-of the filename filter. Type a literal, case-sensitive search term and press Enter.
+Press `s` in Changes to search only files changed by the selected commit or
+commit range (or by the current working-tree/Unpushed comparison). In Files,
+`s` searches the entire displayed tree. The search title names the scope;
+press Tab in search to switch between changed files and all files, then Enter
+to search. Sidebar filename filters do not restrict either scope.
+
+Changed-file search covers the full contents of those files at the selected
+commit, not just changed lines. For a range it uses the newest selected commit
+and the range's net changed-file list. Deleted files are excluded because they
+have no contents in that snapshot; renamed files use their new paths.
+Type a literal, case-sensitive search term and press Enter.
 Results show `path:line` and a text preview. Use Up/Down and Enter to open the full
 file at that line, with surrounding code. Press `s` again to return to the results,
 `/` to edit the query, or Esc to cancel/back out. Ctrl+U clears the query while editing.

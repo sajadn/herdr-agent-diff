@@ -758,8 +758,26 @@ struct CommitPicker {
     commits_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum SearchScope {
+    #[default]
+    AllFiles,
+    ChangedFiles,
+}
+
+impl SearchScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AllFiles => "all files",
+            Self::ChangedFiles => "changed files",
+        }
+    }
+}
+
 #[derive(Default)]
 struct CodeSearch {
+    scope: SearchScope,
+    return_scope: Option<SearchScope>,
     query: String,
     editing: bool,
     loading: bool,
@@ -1204,26 +1222,30 @@ impl App {
         }
     }
 
+    fn request_git_scan(&mut self, tasks: &mpsc::SyncSender<Task>) {
+        if self.git_state != GitState::Unloaded {
+            return;
+        }
+        self.render_generation = self.render_generation.saturating_add(1);
+        let generation = self.render_generation;
+        self.requested.clear();
+        if tasks
+            .try_send(Task::GitScan {
+                generation,
+                comparison: self.changes_mode.comparison(),
+            })
+            .is_ok()
+        {
+            self.git_state = GitState::Loading;
+        }
+    }
+
     fn request_selected(&mut self, tasks: &mpsc::SyncSender<Task>) {
         if matches!(self.mode, Mode::Commits | Mode::Search) {
             return;
         }
         if self.tab == Tab::Changes && self.git_state != GitState::Loaded {
-            if self.git_state == GitState::Loading {
-                return;
-            }
-            self.render_generation = self.render_generation.saturating_add(1);
-            let generation = self.render_generation;
-            self.requested.clear();
-            if tasks
-                .try_send(Task::GitScan {
-                    generation,
-                    comparison: self.changes_mode.comparison(),
-                })
-                .is_ok()
-            {
-                self.git_state = GitState::Loading;
-            }
+            self.request_git_scan(tasks);
             return;
         }
         if self.loading {
@@ -1284,6 +1306,7 @@ impl App {
         if self.tab != Tab::Changes {
             return;
         }
+        self.invalidate_search();
         self.changes_mode = match self.changes_mode {
             ChangesMode::Git => ChangesMode::Unpushed,
             ChangesMode::Unpushed | ChangesMode::Commit(_) | ChangesMode::CommitRange(_) => {
@@ -1324,6 +1347,7 @@ impl App {
 
     fn invalidate_search(&mut self) {
         self.file_find = FileFind::default();
+        self.search.return_scope = None;
         if self.mode == Mode::FileFind {
             self.mode = Mode::Normal;
         }
@@ -1337,7 +1361,28 @@ impl App {
         }
     }
 
+    fn set_search_scope(&mut self, scope: SearchScope) {
+        if self.search.scope != scope {
+            self.search.newest.fetch_add(1, Ordering::AcqRel);
+            self.search.scope = scope;
+            self.search.results = crate::search::SearchResults::default();
+            self.search.loading = false;
+            self.search.selected = 0;
+            self.search.error = None;
+            self.search.jump = None;
+            self.search.editing = true;
+        }
+    }
+
     fn open_search(&mut self) {
+        let scope = self.search.return_scope.take().unwrap_or(
+            if self.tab == Tab::Changes && self.mode != Mode::Commits {
+                SearchScope::ChangedFiles
+            } else {
+                SearchScope::AllFiles
+            },
+        );
+        self.set_search_scope(scope);
         self.mode = Mode::Search;
         self.search.editing = self.search.results.hits.is_empty() && !self.search.loading;
     }
@@ -1355,9 +1400,28 @@ impl App {
         if self.search.query.is_empty() {
             return;
         }
+        let files = if self.search.scope == SearchScope::ChangedFiles {
+            if self.git_state != GitState::Loaded {
+                self.request_git_scan(tasks);
+                self.search.error = Some("Changed files are loading; press Enter to retry.".into());
+                return;
+            }
+            if let Some(error) = &self.git_error {
+                self.search.error = Some(format!("Unable to read changed files: {error}"));
+                return;
+            }
+            let paths: BTreeSet<_> = self.git_changes.iter().map(|change| &change.path).collect();
+            self.files
+                .iter()
+                .filter(|file| paths.contains(&file.relative))
+                .cloned()
+                .collect()
+        } else {
+            self.files.clone()
+        };
         let task = Task::Search {
             request: self.search.newest.load(Ordering::Acquire),
-            files: self.files.clone(),
+            files,
             revision: self.revision().map(str::to_owned),
             query: self.search.query.clone(),
             newest: Arc::clone(&self.search.newest),
@@ -1371,6 +1435,13 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent, tasks: &mpsc::SyncSender<Task>) {
+        if key.code == KeyCode::Tab {
+            self.set_search_scope(match self.search.scope {
+                SearchScope::AllFiles => SearchScope::ChangedFiles,
+                SearchScope::ChangedFiles => SearchScope::AllFiles,
+            });
+            return;
+        }
         if key.code == KeyCode::Esc || (!self.search.editing && key.code == KeyCode::Char('q')) {
             self.search.newest.fetch_add(1, Ordering::AcqRel);
             self.search.loading = false;
@@ -1414,6 +1485,7 @@ impl App {
                     && let Some(index) =
                         self.files.iter().position(|file| file.relative == hit.path)
                 {
+                    self.search.return_scope = Some(self.search.scope);
                     self.search.jump = Some((index, hit.line));
                     self.tab = Tab::Files;
                     self.files_state = TabState::default();
@@ -2792,10 +2864,10 @@ impl App {
                 self.search.query,
                 if self.search.editing { "_" } else { "" }
             ))
-            .block(
-                Block::bordered()
-                    .title(format!(" Search code — {scope} — literal, case-sensitive ")),
-            ),
+            .block(Block::bordered().title(format!(
+                " Search code — {} — {scope} — literal, case-sensitive ",
+                self.search.scope.label()
+            ))),
             query_area,
         );
         let results = &self.search.results;
@@ -2876,9 +2948,10 @@ impl App {
             self.file_find.status()
         } else if self.mode == Mode::Search {
             if self.search.editing {
-                "Enter search   Backspace edit   Ctrl+U clear   Esc back".into()
+                "Enter search   Tab changed/all files   Backspace edit   Ctrl+U clear   Esc back"
+                    .into()
             } else {
-                "↑↓ choose result   Enter open at line   / edit search   Esc back   s returns to results".into()
+                "↑↓ choose result   Enter open at line   Tab changed/all files   / edit search   Esc back".into()
             }
         } else if self.mode == Mode::Commits {
             if self.picker.commit_filtering {
@@ -3440,7 +3513,7 @@ impl App {
             Paragraph::new(
                 "Git Changes\n\n\
                  1 / 2       Changes review / Files browser\n\
-                 s           Search file contents; Enter searches / opens a result at its line\n\
+                 s           Search contents: Changes tab limits to changed files; Tab toggles scope\n\
                  Ctrl+F      Find in open file; Enter/n next, Shift+Enter/N previous, Esc back\n\
                  b           Show / hide the sidebar\n\
                  c           Pick commits (Space/x marks; Shift+Up/Down range; Enter review)\n\
@@ -4850,9 +4923,164 @@ mod tests {
     }
 
     #[test]
+    fn changed_file_search_uses_review_paths_and_tip_without_sidebar_filters() {
+        let commit = crate::git::GitCommit {
+            oid: "a".repeat(40),
+            parent: "b".repeat(40),
+            date: String::new(),
+            subject: String::new(),
+        };
+        for mode in [
+            ChangesMode::Commit(commit.clone()),
+            ChangesMode::CommitRange(crate::git::GitCommitRange {
+                newest: commit.clone(),
+                oldest: commit.clone(),
+                count: 2,
+            }),
+        ] {
+            let mut app = App::new("w1:p1".into());
+            app.loading = false;
+            app.changes_mode = mode;
+            app.files = vec![file("edited.rs"), file("renamed.rs"), file("unchanged.rs")];
+            let mut renamed = git_change("renamed.rs", ChangeKind::Renamed);
+            renamed.old_path = Some("old.rs".into());
+            app.apply_git_scan(
+                &app.changes_mode.comparison(),
+                vec![
+                    git_change("edited.rs", ChangeKind::Modified),
+                    renamed,
+                    git_change("deleted.rs", ChangeKind::Deleted),
+                ],
+                None,
+                None,
+            );
+            app.changes_state.filter = "edited.rs".into();
+            app.open_search();
+            app.search.query = "needle".into();
+            let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+            app.submit_search(&tasks);
+            let Task::Search {
+                files, revision, ..
+            } = queued.try_recv().unwrap()
+            else {
+                panic!("expected changed-file search");
+            };
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|file| file.relative.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["edited.rs", "renamed.rs"]
+            );
+            assert_eq!(revision.as_deref(), Some(commit.oid.as_str()));
+            assert!(render(&mut app, 140, 20).contains("changed files"));
+        }
+    }
+
+    #[test]
+    fn changed_search_can_switch_scope_and_return_from_opened_result() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.files = vec![file("edited.rs"), file("unchanged.rs")];
+        app.apply_git_scan(
+            &GitComparison::WorkingTree,
+            vec![git_change("edited.rs", ChangeKind::Modified)],
+            None,
+            None,
+        );
+        app.open_search();
+        app.search.query = "needle".into();
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        app.submit_search(&tasks);
+        let Task::Search { request, .. } = queued.try_recv().unwrap() else {
+            panic!("search");
+        };
+        app.apply_result(WorkResult::Search {
+            request,
+            result: Ok(crate::search::SearchResults {
+                hits: vec![crate::search::SearchHit {
+                    path: "edited.rs".into(),
+                    line: 0,
+                    preview: "needle".into(),
+                }],
+                ..Default::default()
+            }),
+        });
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tasks);
+        assert_eq!(app.tab, Tab::Files);
+        let _ = queued.try_recv().unwrap(); // Source preview request.
+        app.open_search();
+        assert!(app.search.scope == super::SearchScope::ChangedFiles);
+        assert_eq!(app.search.results.hits.len(), 1);
+        app.handle_search_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tasks);
+        assert!(app.search.results.hits.is_empty());
+        assert!(app.search.editing);
+        app.submit_search(&tasks);
+        let Task::Search {
+            request: all_request,
+            files,
+            ..
+        } = queued.try_recv().unwrap()
+        else {
+            panic!("search");
+        };
+        assert_eq!(files.len(), 2);
+        assert!(render(&mut app, 140, 20).contains("all files"));
+        app.handle_search_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tasks);
+        app.apply_result(WorkResult::Search {
+            request: all_request,
+            result: Ok(crate::search::SearchResults {
+                hits: vec![crate::search::SearchHit {
+                    path: "unchanged.rs".into(),
+                    line: 0,
+                    preview: "needle".into(),
+                }],
+                ..Default::default()
+            }),
+        });
+        assert!(
+            app.search.results.hits.is_empty(),
+            "ignore results from previous scope"
+        );
+    }
+
+    #[test]
+    fn changed_search_waits_for_git_scan_and_reports_errors_without_searching_all_files() {
+        let mut app = App::new("w1:p1".into());
+        app.loading = false;
+        app.files = vec![file("unchanged.rs")];
+        app.open_search();
+        app.search.query = "needle".into();
+        let (tasks, queued) = std::sync::mpsc::sync_channel(8);
+        app.submit_search(&tasks);
+        assert!(matches!(queued.try_recv(), Ok(Task::GitScan { .. })));
+        assert!(queued.try_recv().is_err());
+        assert!(app.search.editing);
+        app.apply_git_scan(
+            &GitComparison::WorkingTree,
+            vec![],
+            None,
+            Some("git failed".into()),
+        );
+        app.submit_search(&tasks);
+        assert!(app.search.error.as_ref().unwrap().contains("git failed"));
+        assert!(queued.try_recv().is_err());
+        app.apply_git_scan(&GitComparison::WorkingTree, vec![], None, None);
+        app.submit_search(&tasks);
+        let Task::Search { files, .. } = queued.try_recv().unwrap() else {
+            panic!("search");
+        };
+        assert!(
+            files.is_empty(),
+            "an empty diff must never fall back to the whole tree"
+        );
+    }
+
+    #[test]
     fn code_search_opens_full_file_at_result_after_async_preview() {
         let mut app = App::new("w1:p1".into());
         app.loading = false;
+        app.tab = Tab::Files;
         app.files = vec![file("a.rs"), file("nested/b.rs")];
         app.file_search_index = super::FileSearchIndex::from_files(&app.files);
         app.files_state.filter = "a.rs".into();
@@ -4924,6 +5152,7 @@ mod tests {
         for refresh in [false, true] {
             let mut app = App::new("w1:p1".into());
             app.loading = false;
+            app.tab = Tab::Files;
             app.open_search();
             app.search.query = "query".into();
             let (tasks, queued) = std::sync::mpsc::sync_channel(8);
